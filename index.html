@@ -1,2191 +1,1383 @@
-import os
-import time
-import sys
-import uvicorn
-
-# --- Force joblib to use threading backend ---
-# This is a crucial fix for web servers. Libraries like phonemizer (a dependency
-# of kokoro) use joblib for parallelism. In a web server context, trying to 
-# spawn new processes from a worker thread can lead to deadlocks or crashes.
-# Forcing the 'threading' backend ensures that these libraries use threads
-# instead of processes, which is safe.
-os.environ['JOBLIB_DEFAULT_BACKEND'] = 'threading'
-
-import asyncio
-import json
-import re
-import shutil
-import uuid
-try:
-    import requests
-    HAS_REQUESTS = True
-except ImportError:
-    requests = None
-    HAS_REQUESTS = False
-
-import jiwer
-import webbrowser
-import scipy.io.wavfile as wav
-import urllib.parse
-import io
-import html
-import mimetypes
-import numpy as np
-import ast
-import sqlite3
-import logging
-import gc
-from scipy.signal import correlate
-from pydantic import BaseModel, Field
-from typing import Optional, List, Union, Dict, Tuple
-from fastapi import FastAPI, WebSocket, Request, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-import traceback
-from fastapi import Response
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from dotenv import load_dotenv
-
-# --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Suppress noisy HTTP logs from libraries
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# Ensure stdout handles UTF-8 (crucial for Windows consoles displaying emojis)
-if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding='utf-8')
-
-
-# Robust import for faster_whisper with helpful error message
-try:
-    from faster_whisper import WhisperModel, decode_audio
-except ImportError:
-    logger.critical("❌ Critical Error: 'faster_whisper' module not found. Python 3.10-3.12 required.")
-    sys.exit(1)
-
-
-from kokoro_onnx import Kokoro
-import edge_tts
-from textwrap import dedent
-
-try:
-    from agno.agent import Agent
-    from agno.models.ollama import Ollama
-except ImportError:
-    logger.critical("❌ Critical Error: 'agno' module not found. Please run 'pip install agno'.")
-    sys.exit(1)
-
-# Load environment variables
-load_dotenv()
-
-# --- Cloud API Configuration (The "Perfect" Stack) ---
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-
-IN_DOCKER = os.path.exists('/.dockerenv')
-
-# Optional override: Force using the cloud model (Groq) even when a local Ollama instance is configured.
-FORCE_GROQ = str(os.getenv("FORCE_GROQ", "")).strip().lower() in {"1", "true", "yes", "y"}
-
-# Optional override: Force Groq as the only LLM path (useful for South Indian languages when local Ollama quality is low).
-GROQ_ONLY = str(os.getenv("GROQ_ONLY", "")).strip().lower() in {"1", "true", "yes", "y"} or IN_DOCKER
-
-if IN_DOCKER:
-    logger.info("🐳 Docker environment detected. Enforcing GROQ_ONLY to resolve LLM memory overhead.")
-
-# Memory Optimization: Run entirely on Cloud APIs to fit in <512MB RAM (Render/Railway)
-CLOUD_ONLY = str(os.getenv("CLOUD_ONLY", "")).strip().lower() in {"1", "true", "yes", "y"}
-
-# --- Timeout Configuration (Configurable via Environment Variables) ---
-# Groq cloud API timeout (increased from 10s to 30s for reliability)
-GROQ_TIMEOUT = int(os.getenv("GROQ_TIMEOUT", "30"))
-# Local Ollama timeouts per tier
-OLLAMA_TIMEOUTS = {
-    "low_latency": int(os.getenv("OLLAMA_TIMEOUT_LOW_LATENCY", "25")),
-    "balanced": int(os.getenv("OLLAMA_TIMEOUT_BALANCED", "60")),
-    "high_quality": int(os.getenv("OLLAMA_TIMEOUT_HIGH_QUALITY", "120"))
-}
-# Fallback cloud timeout multiplier (2x the local timeout, minimum 60s for reliability)
-CLOUD_FALLBACK_TIMEOUT_MULTIPLIER = float(os.getenv("CLOUD_FALLBACK_TIMEOUT_MULTIPLIER", "1.5"))
-CLOUD_FALLBACK_MIN_TIMEOUT = int(os.getenv("CLOUD_FALLBACK_MIN_TIMEOUT", "60"))
-
-# Configuration Constants
-SAMPLE_RATE = 16000          # Audio sample rate (Hz)
-SPEED = 1.0                  # Speech rate multiplier (1.0 is standard, 1.1 can be rushed)
-VOICE_PROFILE = "af_heart"   # Voice character selection
-ACTIVE_TIER = "high_quality" # Defaulting to high_quality (large-v3) for accurate Non-English/Indian language transcription
-
-# --- Tier Configuration ---
-TIER_CONFIG = {
-    "low_latency":  {
-        "whisper_model": "base",
-        "beam_size": 1 # Greedy decoding for max speed
-    },
-    "balanced":     {
-        "whisper_model": "small",
-        "beam_size": 5 # Beam search: Essential for accuracy in Indian languages (Telugu, Hindi)
-    },
-    "high_quality": {
-        "whisper_model": "large-v3", # Upgraded to large-v3 for best Telugu/Indian language accuracy
-        "beam_size": 5 # Beam search is essential for quality
-    },
-    "distilled": {
-        "whisper_model": "distil-large-v3", # Distillation: Smaller, faster version of large-v3
-        "beam_size": 1 # Greedy decoding works well with distilled models
-    }
-}
-
-# --- Multilingual Priming (Prevents Hallucinations) ---
-# Supported language codes (ISO 639-1)
-SUPPORTED_LANGUAGES = {"en", "hi", "te", "ta", "kn", "ml"}
-
-# Mapping for friendly names
-LANGUAGE_NAMES = {
-    "en": "English",
-    "hi": "Hindi",
-    "te": "Telugu",
-    "ta": "Tamil",
-    "kn": "Kannada",
-    "ml": "Malayalam",
-}
-
-# Priming prompts for each supported language to help Whisper avoid hallucinations.
-# These are short, natural phrases in the target script.
-PRIMING_PROMPTS = {
-    "en": "Umm, I... I... Hello, my name is... my name is John.",
-    "hi": "मैं... मैं... नमस्ते, मेरा नाम है... मेरा नाम है रवि।",
-    "te": "నేను... నేను... హాయ్, నా పేరు... నా పేరు రాజు.",
-    "ta": "நான்... நான்... வணக்கம், எனது பெயர்... எனது பெயர் ராஜ்.",
-    "kn": "ನಾನು... ನಾನು... ನಮಸ್ಕಾರ, ನನ್ನ ಹೆಸರು... ನನ್ನ ಹೆಸರು ರಾಜ್.",
-    "ml": "ഞാൻ... ഞാൻ... ഹായ്, എന്റെ പേര്... എന്റെ പേര് രാജു.",
-}
-
-# Languages where local models struggle and cloud APIs are preferred (Indian + complex scripts)
-COMPLEX_LANGUAGES = {"hi", "te", "ta", "kn", "ml"}
-
-# South Indian languages that need special Whisper tuning for better accuracy
-SOUTH_INDIAN_LANGS = {"te", "ta", "kn", "ml"}
-
-# --- Agent Architecture: Model-Based & Goal-Based ---
-
-class AgentInternalState(BaseModel):
-    """
-    Model-Based Reflex Agent Component:
-    Maintains an internal model of the world (user) to account for unobservable aspects
-    (like historical fluency trends and emotional trajectory).
-    """
-    session_id: str
-    history: List[dict] = [] # Conversation history
-    fluency_scores: List[float] = [] # Track performance over time
-    emotional_state: str = "Neutral" # Current estimated emotional state
-    last_strategy: Optional[str] = None # The strategy used in the previous turn
-    strategy_performance: Dict[str, float] = {} # Tracks cumulative success of strategies
-    last_interaction: float = Field(default_factory=time.time) # For memory cleanup
-    learning_rate: float = 0.5 # Decay factor for strategy performance updates.
-
-    def update_model(self, user_input: str, assistant_output: dict):
-        """Updates the internal state based on new percepts and actions."""
-        
-        # 1. Evaluate Previous Strategy (Learning from the past)
-        current_score = 0
-        if "metrics" in assistant_output and "rate" in assistant_output["metrics"]:
-            current_score = assistant_output["metrics"]["rate"]
-            
-        if self.fluency_scores and self.last_strategy:
-            prev_score = self.fluency_scores[-1]
-            delta = current_score - prev_score
-            
-            if self.last_strategy not in self.strategy_performance:
-                self.strategy_performance[self.last_strategy] = 0.0
-            
-            # Update performance with a decay factor (learning rate).
-            # This makes the agent more responsive to recent interactions.
-            # Old performance score is weighted by (1 - learning_rate), new performance (delta) is weighted by learning_rate.
-            self.strategy_performance[self.last_strategy] = (1 - self.learning_rate) * self.strategy_performance[self.last_strategy] + self.learning_rate * delta
-
-        # Update History
-        self.history.append({"user": user_input, "assistant": assistant_output.get("text", "")})
-        if len(self.history) > 10:
-            self.history = self.history[-10:]
-        
-        # Update Derived Metrics (The "Model")
-        if "metrics" in assistant_output and "rate" in assistant_output["metrics"]:
-            self.fluency_scores.append(float(assistant_output["metrics"]["rate"]))
-            # Limit fluency scores history to prevent unbounded growth
-            if len(self.fluency_scores) > 50:
-                self.fluency_scores = self.fluency_scores[-50:]
-        
-        if "soap" in assistant_output and "s" in assistant_output["soap"]:
-            self.emotional_state = assistant_output["soap"]["s"]
-            
-        self.last_interaction = time.time()
-
-class GoalBasedStrategy(BaseModel):
-    """
-    Goal-Based Agent Component:
-    Determines the best path (strategy) toward a desired state.
-    """
-    current_goal: str
-    tactical_instruction: str
-
-def determine_agent_goal(state: AgentInternalState) -> GoalBasedStrategy:
-    """
-    Evaluates the internal model to set a specific goal for the next interaction.
-    This function implements the core "brain" of the goal-based agent. It looks at
-    the user's recent performance and emotional state to decide on the best
-    therapeutic strategy, and then adapts that strategy based on historical
-    effectiveness.
-    """
-    # Calculate average fluency from recent history
-    recent_scores = state.fluency_scores[-3:] if state.fluency_scores else []
-    avg_fluency = sum(recent_scores) / len(recent_scores) if recent_scores else 0
-    
-    # Base Logic to determine Candidate Goal
-    candidate_goal = ""
-    candidate_instruction = ""
-    logger.info(f"Determining goal. Avg Fluency: {avg_fluency:.2f}, Emotional State: {state.emotional_state}")
-
-    if not state.history:
-        candidate_goal = "Assessment & Rapport"
-        candidate_instruction = "Establish a supportive baseline. Analyze speech patterns carefully without being overly corrective."
-    elif avg_fluency < 40 or "anxious" in state.emotional_state.lower():
-        candidate_goal = "Anxiety Reduction"
-        candidate_instruction = "Prioritize emotional support. Use gentle, encouraging language. Suggest breathing or pausing techniques. Do NOT focus on minor errors."
-    elif 40 <= avg_fluency < 80:
-        candidate_goal = "Fluency Shaping"
-        candidate_instruction = "Focus on specific techniques like 'Easy Onset' or 'Light Contact'. Provide constructive feedback on the specific disfluencies detected."
-    else:
-        candidate_goal = "Naturalness & Generalization"
-        candidate_instruction = "Focus on prosody, intonation, and confidence. Challenge the user to maintain fluency with longer, more complex sentences."
-
-    # --- ENHANCEMENT: ADAPTIVE STRATEGY SELECTION ---
-    # Check if the chosen strategy has performed poorly in the past.
-    # If the strategy has a significantly negative performance score, switch tactics.
-    if candidate_goal in state.strategy_performance:
-        perf_score = state.strategy_performance[candidate_goal]
-        logger.info(f"Evaluating candidate goal '{candidate_goal}' with performance score: {perf_score:.2f}")
-        if perf_score < -15: # Threshold: Strategy has caused cumulative regression of 15% fluency
-            # Adaptive Fallback Logic
-            if candidate_goal == "Fluency Shaping":
-                # If shaping fails, user might be overwhelmed. Go back to support.
-                logger.warning(f"ADAPTIVE SHIFT: '{candidate_goal}' has a poor performance score. Switching to 'Anxiety Reduction'.")
-                candidate_goal = "Anxiety Reduction"
-                candidate_instruction = "Adaptive Change: Previous shaping attempts reduced fluency. Reverting to emotional support and gentle pacing to rebuild confidence."
-            elif candidate_goal == "Naturalness & Generalization":
-                # If generalization fails, they aren't ready. Go back to structure.
-                logger.warning(f"ADAPTIVE SHIFT: '{candidate_goal}' has a poor performance score. Switching to 'Fluency Shaping'.")
-                candidate_goal = "Fluency Shaping"
-                candidate_instruction = "Adaptive Change: Generalization caused regression. Returning to structured fluency techniques."
-
-    return GoalBasedStrategy(current_goal=candidate_goal, tactical_instruction=candidate_instruction)
-
-# --- Persistence Layer (SQLite) ---
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "sessions.db")
-
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, data TEXT, last_interaction REAL)")
-    logger.info("💽 Session database initialized.")
-
-def load_session(session_id: str) -> Optional[AgentInternalState]:
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.execute("SELECT data FROM sessions WHERE id = ?", (session_id,))
-            row = cursor.fetchone()
-            if row:
-                return AgentInternalState.model_validate_json(row[0])
-    except Exception as e:
-        logger.error(f"Failed to load session {session_id}: {e}")
-    return None
-
-def save_session(state: AgentInternalState):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT OR REPLACE INTO sessions (id, data, last_interaction) VALUES (?, ?, ?)",
-                     (state.session_id, state.model_dump_json(), state.last_interaction))
-
-# --- Pydantic Models for Structured Output ---
-class Metrics(BaseModel):
-    words: int
-    disfluencies: int
-    rate: int
-
-class SoapNotes(BaseModel):
-    s: str
-    o: str
-    a: str
-    p: str
-
-class SpeechAnalysis(BaseModel):
-    thoughts: Optional[str] = Field(None, description="Step-by-step reasoning process regarding the speech patterns.")
-    text: str = Field(..., description="The corrected, fluent version of the speech.")
-    english_translation: str = Field("", description="English translation of the input text. Required for Tamil, Kannada, Malayalam, Hindi, and Telugu. Empty for English.")
-    metrics: Metrics
-    analysis: str = Field(..., description="HTML formatted analysis.")
-    suggestions: str = Field(..., description="HTML formatted suggestions.")
-    soap: SoapNotes
-    level: str
-    classification: str
-    demographics: str
-
-# --- Embedded Knowledge Base ---
-therapy_knowledge_base_content = """
-dysfluency_patterns:
-  - pattern: "Sound Repetition (SR)"
-    description: "Repetition of phonemes or syllables (e.g., 'bu-bu-butterfly', 'li-li-like')."
-    example: "p-p-paper"
-  - pattern: "Word Repetition (WR)"
-    description: "Repetition of whole words (e.g., 'I-I am')."
-    example: "I-I-I want to go."
-  - pattern: "Prolongation (PR)"
-    description: "Extended phonemes within a word (e.g., 'S-s-s-ee')."
-    example: "Ssssssometimes I get stuck."
-  - pattern: "Block (B)"
-    description: "Pauses or stoppages in speech where no sound is produced."
-    example: "I want a ...... glass of water."
-  - pattern: "Interjection (IN)"
-    description: "Insertion of unnecessary phonemes or syllables like 'um', 'uh', or 'like'."
-    example: "I, um, need to, uh, think."
-
-language_specific_insights:
-  - language: "English"
-    triggers: "Plosives (p, b, t, d, k, g), fricatives (s, f), and sentence-initial vowels."
-  - language: "Telugu"
-    triggers: "Retroflex consonants (ఠ, డ, ణ), complex consonant clusters, and initial vowels. Pay special attention to word boundaries when reconstructing from fragments."
-    note: "Telugu has agglutinative morphology. Loss of suffixes can change meaning. Preserve case markers and verb tense indicators."
-  - language: "Tamil"
-    triggers: "Geminated consonants (doubled sounds), retroflex stops, and code-switching with English. Tamil has ergative alignment which affects particle placement."
-    note: "Preserve Tamil particles (um, -ai, -ey). Respect dialectal variations between formal literary and colloquial speech."
-  - language: "Kannada"
-    triggers: "Uvular sounds (retroflex r, ණ), gemination, and complex verb conjugations. Kannada lacks gender in most contexts."
-    note: "Protect case-marking suffixes and tense markers. Handle geminated consonants carefully as they change word meaning."
-  - language: "Malayalam"
-    triggers: "Chillu letters (ൾ, ൻ, ൺ, ർ, ൽ) combining with short vs long consonants. Presence of schwa insertion patterns common in spontaneous speech."
-    note: "Malayalam script combines consonant+vowel units (aksharas). Protect vowel diacritics (maatras). Casual speech often drops case endings."
-
-boli_dataset_insights:
-  - common_triggers: "Stop consonants (/p/, /t/, /k/), complex clusters (/str/, /br/, /pl/), and fricatives (/f/, /sh/, /th/)."
-  - observation: "Stuttering is often less frequent in spontaneous speech compared to read speech. Anxiety is higher with unfamiliar listeners."
-
-therapeutic_techniques:
-  - technique: "Pacing and Slow Rate"
-    description: "Intentionally slowing down the rate of speech. This can be done by pausing between words or stretching out vowels. It gives more time for motor planning and execution."
-    when_to_use: "General strategy for reducing overall stuttering frequency."
-  - technique: "Easy Onset / Light Articulatory Contact"
-    description: "Beginning phonation of a word gently and with less tension. For example, starting a vowel with a gentle breath ('hhhh-apple') or using light contact for consonants like 'p' or 't'."
-    when_to_use: "Helpful for reducing blocks and hard glottal attacks at the beginning of words."
-  - technique: "Breathing and Pausing"
-    description: "Using diaphragmatic (belly) breathing and taking appropriate pauses before speaking or between phrases. This helps manage anxiety and ensures sufficient breath support."
-    when_to_use: "Effective for managing physical tension and preventing blocks caused by breath-holding."
-  - technique: "Continuous Phonation"
-    description: "Linking words together smoothly so that the voice continues to flow with minimal interruption, reducing the number of starts and stops."
-    when_to_use: "Useful for reducing instances of initial-word blocks or repetitions."
-
-prevention_and_management:
-  - strategy: "Secondary Behavior Prevention"
-    description: "Identifying and reducing physical concomitants (eye blinking, head nodding) before they become ingrained."
-  - strategy: "Desensitization"
-    description: "Voluntary stuttering or 'bouncing' to reduce the fear of stuttering, which often fuels the severity of blocks."
-  - strategy: "Relapse Prevention"
-    description: "Regular practice of 'Pull-outs' (easing out of a stutter) and 'Cancellations' (pausing and re-saying the word) to maintain fluency."
-
-"""
-# --- Agent Setup (Merged from agent_client.py) ---
-ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-if "0.0.0.0" in ollama_host:
-    print("⚠️  Warning: OLLAMA_HOST is set to 0.0.0.0. Replacing with 127.0.0.1 for client connection.")
-    ollama_host = ollama_host.replace("0.0.0.0", "127.0.0.1")
-logger.info(f"🔌 Connecting to Ollama at: {ollama_host}")
-
-knowledge_agent_ai = Agent(
-    model=Ollama(id="llama3.1:8b", host=ollama_host, options={"temperature": 0.0, "num_ctx": 8192}),
-    instructions=dedent(f"""
-        You are an expert Speech Language Pathologist AI assistant specialized in speech therapy, capable of analyzing speech patterns in multiple languages including English and South Indian languages (Telugu, Tamil, Kannada, Malayalam).
-        
-        CORE DIRECTIVE: You must output ONLY a valid JSON object.
-        CRITICAL RULES FOR SOUTH INDIAN LANGUAGES:
-        1. PRESERVE EVERY CHARACTER AND DIACRITICAL MARK - These are essential for meaning in Telugu, Tamil, Kannada, and Malayalam.
-        2. RESTORE MISSING MORPHEMES - South Indian languages are agglutinative. Restore dropped case markers, verb endings, and suffixes based on grammatical context.
-        3. HANDLE SPECIAL CHARACTERS - Telugu: ఠ్, ఢ్, ఱ (retroflex marks), Tamil: ழ, Tamil particles, Kannada: geminated consonants (ಕ್ಕ), Malayalam: chillu letters (ൾ,ൻ).
-        4. DETECT MISSING WORDS - Stuttering in South Indian languages may result in dropped syllables or morphemes. Use linguistic knowledge to restore them.
-        5. CONTEXT RECONSTRUCTION - For Telugu: reconstruct ఎ-ఎ-ఎక్కడ -> ఎక్కడ. For Tamil: పो-పో-పోరెన్ -> పోరెన్. For Kannada: ಬ-ಬ-ಬರ -> ಬರ.
-        
-        CRITICAL RULE FOR ALL LANGUAGES:
-        6. MEANING & SPELLING - Fix all spelling mistakes caused by stuttering (e.g., "गगई" -> "गई"). Remove grammatically confused words inserted due to stuttering panic. The final text MUST be a coherent, meaningful, and naturally spelled sentence.
-        
-        CRITICAL: Do NOT hallucinate facts. In your analysis, ONLY cite words that appear in the user's input. Do not use words from other languages or examples.
-
-        CHAIN OF THOUGHT REASONING:
-        You utilize Chain-of-Thought reasoning to analyze speech patterns deeply before generating a response.
-        Include your step-by-step reasoning in the "thoughts" field of the JSON output.
-        Do NOT output plain text, as it breaks the speech correction pipeline.
-        Pay special attention to emotions, feelings, and implied body language to refine your demographic analysis.
-        
-        THERAPY KNOWLEDGE BASE:
-        {therapy_knowledge_base_content}
-        Use 'language_specific_insights' to tailor your analysis based on the detected language.
-        
-        STRUCTURED CLINICAL FRAMEWORK (MANDATORY):
-        You must organize your response into these specific clinical buckets to ensure depth.
-
-        1. ANALYSIS (High Resolution):
-           - Subsection 1: Primary Dysfluency Types (Count and categorize: Repetitions, Prolongations, Blocks).
-           - Subsection 2: Secondary Behaviors (Infer tension, struggle, or eye blinking based on acoustic cues like pitch rise or long blocks).
-           - Subsection 3: Linguistic Trigger Analysis (Identify specific phonemes like retroflex sounds 'ṭ' or plosives 'p/b' causing issues).
-
-        2. SOAP NOTES (Clinical Documentation):
-           - S (Subjective): Describe the user's perceived "Locus of Control" and emotional frustration level.
-           - O (Objective): List specific word counts, dysfluency percentages, and acoustic observations (e.g., "High pitch variance indicating tension").
-           - A (Assessment): Provide a Severity Rating (Mild/Moderate/Severe) based on SSI-4 criteria.
-           - P (Plan): Prescribe at least two specific Home Exercises (e.g., "Negative Practice", "Pausing", "Easy Onset").
-
-        3. SUGGESTIONS (Therapeutic Plan):
-           - Provide a 3-stage plan: 
-             * Immediate (e.g., Breathing techniques)
-             * Short-term (e.g., Light Articulatory Contact)
-             * Maintenance (e.g., Cancellations/Pull-outs)
-
-        IN-CONTEXT LEARNING EXAMPLES (FEW-SHOT):
-        - Input (English): "I... I... I want to go."
-          Output:
-          {{
-            "thoughts": "Detected English. Identified Word Repetition (WR) on 'I'. Strategy: Remove repetitions.",
-            "text": "I want to go.",
-            "english_translation": "",
-            "metrics": {{"words": 5, "disfluencies": 2, "rate": 60}},
-            "analysis": "<ul><li><b>Primary:</b> Word Repetition (WR) of initial pronoun 'I'.</li><li><b>Secondary:</b> Likely tension in onset.</li><li><b>Linguistic:</b> Initial vowel trigger.</li></ul>",
-            "suggestions": "<ul><li><b>Immediate:</b> Diaphragmatic breathing.</li><li><b>Short-term:</b> Easy onset drills.</li><li><b>Maintenance:</b> Daily journaling.</li></ul>",
-            "soap": {{"s": "User appears anxious with external locus of control.", "o": "2 Repetitions in 5 words (40% dysfluency).", "a": "Moderate Developmental Stuttering (SSI-4).", "p": "Initiate easy onset therapy."}},
-            "level": "Beginner",
-            "classification": "Developmental Stuttering",
-            "demographics": "Child"
-          }}
-
-        - Input (Telugu): "నేను... నేను... వెళ్ళాలి"
-          Output:
-          {{
-            "thoughts": "Detected Telugu. Identified Word Repetition (WR) on 'నేను'. Strategy: Remove repetitions while preserving Telugu script.",
-            "text": "నేను వెళ్ళాలి",
-            "english_translation": "I... I... should go",
-            "metrics": {{"words": 3, "disfluencies": 2, "rate": 40}},
-            "analysis": "<ul><li><b>Primary:</b> Word Repetition (WR) of pronoun 'నేను'.</li><li><b>Linguistic:</b> Initial word repetition common in Telugu stuttering.</li></ul>",
-            "suggestions": "<ul><li><b>Immediate:</b> Practice slow Telugu speech.</li><li><b>Short-term:</b> Easy onset with Telugu consonants.</li></ul>",
-            "soap": {{"s": "User shows anxiety in Telugu speech.", "o": "2 repetitions in Telugu text.", "a": "Moderate stuttering in Telugu.", "p": "Telugu-specific fluency exercises."}},
-            "level": "Intermediate",
-            "classification": "Developmental Stuttering",
-            "demographics": "Young adult Telugu speaker"
-          }}
-
-        Your task is to analyze the provided speech transcription and populate the following JSON schema fields accurately.
-
-        1. "text": (String) The corrected, fluent version of the speech.
-           - **PRIMARY GOAL**: Remove ALL stutters, stammers, repetitions, and blocks while strictly preserving the original language, script, and intended meaning.
-           - **SCRIPT PRESERVATION**: The output script MUST match the input script exactly.
-             * If input is in Telugu script (e.g., "నా... నాకు"), output MUST be in Telugu script ("నాకు").
-             * If input is in Latin/English (e.g., "I... I..."), output MUST be in Latin/English ("I").
-             * Do NOT translate.
-           - **STUTTER REMOVAL**:
-             * Remove repetitions (e.g., "b-b-ball" -> "ball", "I... I..." -> "I", "गगई" -> "गई").
-             * Remove prolongations (e.g., "ssss-snake" -> "snake").
-             * Remove blocks/fillers (e.g., "um", "uh", "like" used as fillers).
-             * Merge fragmented syllables (e.g., "u... u... umbrella" -> "umbrella").
-           - **Contextual Restoration**: If the stuttering has distorted a word (e.g. "mara" instead of "hamara" due to a block), restore the intended word based on the sentence context.
-             * Example: "namu... makin" -> "Namumkin" (Phonetic restoration).
-             * Example: "ha ha ha ha mara ba ba barat ma ma ma han" -> "Hamara Bharat Mahan" (Correcting 'mara'->'Hamara', 'barat'->'Bharat', 'han'->'Mahan' based on the famous phrase).
-             * Example (Ambiguity): "I saw a b-b-b... big dog." -> "I saw a big dog." (Infer 'big' from context, not just completing 'b-b-b' to 'ball').
-           - **Spelling & Coherence Failsafe**: Ensure the reconstructed sentence makes perfect grammatical sense. If a user inserts confused words due to a stuttering block (e.g., "आप क्योंकि किसके साथ..." -> "आप किसके साथ..."), correct the grammar so the final sentence is meaningful and perfectly spelled.
-           
-           - If the input is mixed language (e.g., "Main market ja raha hoon"), KEEP IT MIXED.
-           - Example: "I... I... wanna go" -> "I wanna go" (NOT "I want to go").
-           - **Dialect Preservation**: For Tamil, Telugu, Kannada, and Malayalam, do NOT convert colloquial/spoken forms (e.g., "vosthunna", "poren") to formal written forms (e.g., "vasthunnanu", "pogiren") unless the input is clearly formal. Preserve the speaker's natural register.
-           - **Script Consistency**: Ensure the output script matches the input script (e.g. Devanagari -> Devanagari, Telugu -> Telugu, Tamil -> Tamil, Kannada -> Kannada). Do NOT transliterate to Latin/English script.
-           - **Transliteration Handling**: If the input is in Latin script (e.g., "na peru..." for Telugu), the output MUST remain in Latin script. Do NOT convert it to the native script.
-
-        2. "english_translation": (String) English translation of the input text.
-           - **REQUIRED** for Tamil (ta), Kannada (kn), Malayalam (ml), Hindi (hi), and Telugu (te).
-           - **OPTIONAL** for other languages - provide if the input is not in English.
-           - **EMPTY STRING** ("") for English inputs.
-           - **ACCURATE TRANSLATION**: Preserve the meaning and context of the original speech, including any stuttering patterns in the translation.
-           - **EXAMPLE**: If input is "నేను... నేను... వెళ్ళాలి" (Telugu), translation should be "I... I... should go"
-
-        3. "metrics": (Dictionary) Quantitative analysis of the speech.
-
-
-        3. "metrics": (Dictionary) Quantitative analysis of the speech.
-           - "words": (Integer) Total count of words in the original transcription (including fillers and repetitions).
-           - "disfluencies": (Integer) Total count of dysfluency events detected. Explicitly count:
-             * <b>SR (Sound Repetition)</b>: Part-word/syllable repetitions (e.g., "b-b-ball").
-             * <b>WR (Word Repetition)</b>: Whole-word repetitions (e.g., "I-I-I").
-             * <b>PR (Prolongation)</b>: Stretching sounds (e.g., "ssss-snake").
-             * <b>B (Block)</b>: Silent pauses/stoppages.
-             * <b>IN (Interjection)</b>: Fillers (e.g., "um", "uh").
-           - "rate": (Integer) The calculated fluency score (0-100). Formula: 100 - (disfluencies / words * 100). If 0 disfluencies, rate is 100.
-
-        4. "analysis": (String) A detailed and insightful clinical analysis of speech patterns, formatted as an HTML unordered list (<ul><li>...</li></ul>).
-           - **Core Behaviors**: Identify specific dysfluency types (SR, WR, PR, B, IN) with examples.
-           - **Strict Citation**: When citing examples, YOU MUST USE THE EXACT WORDS FROM THE INPUT. Do not use words from other languages.
-           - **Strict Citation**: When citing examples, YOU MUST USE THE EXACT WORDS FROM THE INPUT.
-           - **Formatting**: Use <b>bold tags</b> for key terms (e.g., "<b>Repetition</b>", "<b>Block</b>") to enhance readability.
-           - **Clarity**: Explain the clinical terms (like 'Blocks' or 'Prolongations') simply and clearly so the user understands exactly what their stuttering pattern was without needing a medical degree.
-           - **Contextual Insight**: Infer emotional state or cognitive load based on the content and speech rate. Use encouraging, empathetic language.
-           - **Clinical Feedback**: Provide professional feedback similar to a Speech-Language Pathologist, noting severity and prognosis.
-           - MUST BE IN ENGLISH, regardless of the input language.
-           - MUST BE IN ENGLISH.
-
-        5. "suggestions": (String) Creative and evidence-based therapeutic interventions, formatted as an HTML unordered list (<ul><li>...</li></ul>).
-           - **Targeted Exercises**: Provide specific exercises addressing the identified patterns (e.g., "Light Articulatory Contact for plosive sounds").
-           - **Actionable & Clear**: Explain *how* to perform the technique step-by-step in plain, easy-to-understand language.
-           - **Rationale & Functional Application**: Briefly explain *why* the technique helps and how to apply it in daily conversation.
-           - **Creative Drills**: Include engaging practice ideas (e.g., "Rhythmic speech practice using a metronome app").
-           - **Prevention & Cure**: Include strategies for preventing secondary behaviors and managing relapse (e.g., "Desensitization to reduce fear").
-           - MUST BE IN ENGLISH.
-        6. "soap": (Dictionary) Clinical documentation in SOAP format.
-           - "s" (Subjective): Observations about the speaker's apparent mood, anxiety level, or confidence based on the text content and disfluencies.
-           - "o" (Objective): Measurable data (e.g., "Speaker exhibited X instances of repetition in a Y-word sample").
-           - "a" (Assessment): Clinical interpretation (e.g., "Signs consistent with moderate developmental stuttering").
-           - "p" (Plan): Recommended plan of action (e.g., "Focus on continuous phonation techniques").
-
-        7. "level": (String) The difficulty/severity level based on disfluency rate.
-           - "Beginner": High disfluency (>10%). Focus on basic breathing, slow pacing, anxiety reduction.
-           - "Intermediate": Moderate disfluency (3-10%). Focus on soft onsets, continuous phonation, phrasing.
-           - "Advanced": Low disfluency (<3%). Focus on intonation, prosody, public speaking confidence.
-           
-        8. "classification": (String) The specific type of dysfluency detected. Choose one:
-           - "Developmental Stuttering": Typical childhood-onset patterns (repetitions, prolongations).
-           - "Neurogenic Stuttering": Associated with neurological issues (consistent disfluencies).
-           - "Cluttering": Rapid, irregular rate, collapsing words.
-           - "Psychogenic Stuttering": Associated with psychological trauma.
-           - "Normal Non-Fluency": Occasional fillers or hesitations typical of normal speech.
-
-        9. "demographics": (String) Inferred demographics.
-           - Analyze **Accent**: Use vocabulary, syntax, and dialect to pinpoint origin.
-           - Analyze **Emotions & Feelings**: Detect anxiety, confidence, frustration, or hesitation.
-           - Analyze **Body Language**: Infer physical tension (e.g., from blocks/struggle behaviors) or relaxation.
-           - Combine these factors to estimate age, gender, and background (e.g., "Anxious Young Adult from Midwest US", "Confident Child").
-
-        REMEMBER: The output must be a raw JSON object starting with {{ and ending with }}.
-
-        ADAPTIVE DIFFICULTY LOGIC & THERAPEUTIC SUGGESTIONS MAPPING:
-
-        1. LEVEL: "Beginner" (High Severity)
-           - Trigger: Disfluency rate > 10%.
-           - Therapeutic Focus: Foundational Control.
-           - REQUIRED SUGGESTIONS (Select relevant ones):
-             * Basic Breathing: Diaphragmatic breathing to establish airflow.
-             * Slow Pacing: Drastically reducing speech rate to manage motor planning.
-             * Anxiety Reduction: Techniques to remain calm during blocks.
-
-        2. LEVEL: "Intermediate" (Moderate Severity)
-           - Trigger: Disfluency rate between 3% and 10%.
-           - Therapeutic Focus: Speech Shaping.
-           - REQUIRED SUGGESTIONS (Select relevant ones):
-             * Soft Onsets: Starting words gently to prevent hard glottal attacks.
-             * Continuous Phonation: Keeping the voice "on" between words to prevent breaks.
-             * Phrasing: Grouping words together logically.
-
-        3. LEVEL: "Advanced" (Low Severity)
-           - Trigger: Disfluency rate < 3%.
-           - Therapeutic Focus: Naturalness & Confidence.
-           - REQUIRED SUGGESTIONS (Select relevant ones):
-             * Intonation & Prosody: Making speech sound natural and expressive rather than robotic.
-             * Public Speaking Confidence: Psychological strategies for speaking in front of others.
-        """),
-)
-
-# Cache pre-built AI agents to avoid re-initializing models on each request.
-AGENT_INSTRUCTIONS = getattr(knowledge_agent_ai, "instructions", None)
-knowledge_agent_cache = {"balanced": knowledge_agent_ai}
-
-def get_ai_agent(analysis_mode: str = "balanced"):
-    """Return a cached Agent instance based on the requested analysis mode."""
-    mode = str(analysis_mode).lower() if analysis_mode else "balanced"
-    if mode in ("speed", "fast", "low_latency"):
-        model_id = os.getenv("OLLAMA_MODEL_LOW_LATENCY", "llama3.2:3b") # Faster for local CPU/low-tier GPU
-    elif mode in ("deep", "high", "high_quality"):
-        model_id = os.getenv("OLLAMA_MODEL_HIGH_QUALITY", "llama3.1:8b")
-    else:
-        model_id = os.getenv("OLLAMA_MODEL_BALANCED", "llama3.1:8b")
-
-    if model_id not in knowledge_agent_cache:
-        logger.info(f"🔧 Instantiating Ollama model for mode={mode} (model={model_id})")
-        knowledge_agent_cache[model_id] = Agent(
-            model=Ollama(id=model_id, host=ollama_host, options={"temperature": 0.0, "num_ctx": 8192}),
-            instructions=AGENT_INSTRUCTIONS or "",
-        )
-
-    return knowledge_agent_cache[model_id]
-
-
-def extract_json_from_text(content: str, prompt_text: str) -> dict:
-    """Robustly extracts and parses JSON from LLM output with better handling for non-Latin scripts."""
-    # 0. Remove <thought> tags (Chain of Thought) to prevent interference with JSON parsing
-    content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
-
-    # 1. Strip markdown fences
-    content = re.sub(r'^```[a-zA-Z0-9]*\s*', '', content, flags=re.MULTILINE)
-    content = re.sub(r'^```\s*', '', content, flags=re.MULTILINE)
-    # Specific fix for ```json tag which might remain
-    content = re.sub(r'^```json\s*', '', content, flags=re.MULTILINE | re.IGNORECASE)
-    content = re.sub(r'```$', '', content, flags=re.MULTILINE)
-
-    # 2. Find the JSON object (first { to last })
-    start = content.find('{')
-    end = content.rfind('}')
-    
-    if start != -1 and end != -1:
-        json_str = content[start:end+1].strip()
-        
-        # Fix common LLM error: "rate": max(...) = 88 -> "rate": 88
-        json_str = re.sub(r'"rate":\s*[^,\n}]+?=\s*(\d+)', r'"rate": \1', json_str)
-        # Fix trailing commas (common LLM error) - safe for Unicode strings
-        json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
-        # NOTE: Comment stripping removed to prevent breaking URLs (e.g. http://) inside strings
-        
-        def clean_and_return(data):
-            if not isinstance(data, dict):
-                raise ValueError("Parsed JSON is not a dictionary")
-            # Unescape HTML content for frontend rendering
-            if "analysis" in data and isinstance(data["analysis"], str):
-                data["analysis"] = html.unescape(data["analysis"])
-            else:
-                data["analysis"] = "<ul><li>Analysis could not be generated cleanly.</li></ul>"
-                
-            if "suggestions" in data and isinstance(data["suggestions"], str):
-                data["suggestions"] = html.unescape(data["suggestions"])
-            else:
-                data["suggestions"] = "<ul><li>Suggestions could not be generated cleanly.</li></ul>"
-                
-            if not data.get("text", "").strip():
-                fallback_text, _ = clean_stuttered_text(prompt_text)
-                data["text"] = fallback_text or prompt_text
-                
-            # Guarantee existence of all required UI fields
-            data.setdefault("english_translation", "")
-            data.setdefault("level", "Unknown")
-            data.setdefault("classification", "Unknown")
-            data.setdefault("demographics", "Unknown")
-            
-            if "metrics" not in data or not isinstance(data["metrics"], dict):
-                data["metrics"] = {"words": len(str(data["text"]).split()), "disfluencies": 0, "rate": 100}
-                
-            if "soap" not in data or not isinstance(data["soap"], dict):
-                data["soap"] = {"s": "-", "o": "-", "a": "-", "p": "-"}
-                
-            return data
-
-        # Attempt 1: Standard JSON parse
-        try:
-            data = json.loads(json_str, strict=False)
-            return clean_and_return(data)
-        except json.JSONDecodeError:
-            pass
-
-        # Attempt 2: Aggressive cleanup (newlines, control chars)
-        # This fixes issues where newlines are literal in strings but not escaped
-        json_str_clean = json_str.replace('\n', ' ').replace('\r', '')
-        json_str_clean = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_str_clean)
-        try:
-            data = json.loads(json_str_clean, strict=False)
-            return clean_and_return(data)
-        except json.JSONDecodeError:
-            pass
-
-        # Attempt 3: Python literal eval (handles single quotes, True/False/None)
-        # Also handle JSON booleans (true/false/null) mixed in Python syntax
-        try:
-            # Replace JSON booleans with Python equivalents if they appear as keywords
-            json_str_python = re.sub(r'\btrue\b', 'True', json_str)
-            json_str_python = re.sub(r'\bfalse\b', 'False', json_str_python)
-            json_str_python = re.sub(r'\bnull\b', 'None', json_str_python)
-            
-            data = ast.literal_eval(json_str_python)
-            if isinstance(data, dict):
-                return clean_and_return(data)
-        except (ValueError, SyntaxError):
-            pass
-
-    raise ValueError("No JSON object found")
-
-def extract_acoustic_features(audio_np: np.ndarray, sample_rate: int = 16000) -> dict:
-    """
-    Extracts basic acoustic features to help the AI distinguish speech patterns.
-    Acts as a lightweight proxy for MFCCs to detect signal characteristics like
-    struggle (energy bursts) or fricative prolongation (high ZCR).
-    """
-    try:
-        if audio_np is None or len(audio_np) == 0:
-            return {"rms": 0.0, "zcr": 0.0, "variance": 0.0}
-            
-        # Handle potential NaNs/Infs in the audio data
-        if not np.isfinite(audio_np).all():
-            audio_np = np.nan_to_num(audio_np)
-
-        # RMS Energy (Loudness/Intensity) - Indicates vocal effort
-        rms = np.sqrt(np.mean(audio_np**2))
-        
-        # Zero Crossing Rate (Noisiness) - High ZCR indicates fricatives (s, f, sh)
-        zcr = ((audio_np[:-1] * audio_np[1:]) < 0).sum() / len(audio_np)
-        
-        # Signal Variance - Indicates dynamic range
-        variance = np.var(audio_np)
-            
-        # Pitch (F0) Estimation using Autocorrelation (Detects Struggle/Tension)
-        f0 = 0.0
-        try:
-            # Analyze a representative segment (max energy) to save compute
-            if len(audio_np) > 2048:
-                frame_size = 2048
-                # Find frame with max energy
-                energies = [np.sum(audio_np[i:i+frame_size]**2) for i in range(0, len(audio_np)-frame_size, frame_size)]
-                if energies:
-                    start_idx = np.argmax(energies) * frame_size
-                    segment = audio_np[start_idx : start_idx + frame_size]
-                else:
-                    segment = audio_np[:frame_size]
-            else:
-                segment = audio_np
-
-            # Apply window and correlate
-            segment = segment * np.hanning(len(segment))
-            corr = correlate(segment, segment, mode='full')
-            corr = corr[len(corr)//2:]
-            
-            # Find peak in valid pitch range (50Hz - 500Hz for speech)
-            # Lags: 16000/500=32 to 16000/50=320
-            lags = np.arange(32, min(len(corr), 320))
-            if len(lags) > 0:
-                peak_lag = lags[np.argmax(corr[lags])]
-                f0 = sample_rate / peak_lag
-        except Exception as e:
-            logger.warning(f"Pitch detection failed: {e}")
-
-        return {
-            "rms": float(rms) if np.isfinite(rms) else 0.0,
-            "zcr": float(zcr) if np.isfinite(zcr) else 0.0,
-            "variance": float(variance) if np.isfinite(variance) else 0.0,
-            "f0": float(f0) if np.isfinite(f0) else 0.0
-        }
-    except Exception as e:
-        logger.warning(f"⚠️ Feature extraction failed: {e}")
-        return {"rms": 0.0, "zcr": 0.0, "variance": 0.0, "f0": 0.0}
-
-
-def normalize_south_indian_text(text: str, lang_code: str) -> str:
-    """
-    Post-processes transcribed text for South Indian languages to fix ONLY clear
-    Whisper transcription hallucinations. DOES NOT touch stutter patterns as they
-    are essential for clinical analysis.
-    
-    Handles Telugu, Tamil, Kannada, and Malayalam.
-    """
-    if not text or lang_code not in SOUTH_INDIAN_LANGS:
-        return text
-    
-    try:
-        # ONLY remove clear Whisper hallucinations - language tokens, system markers
-        hallucinations_si = {
-            "te": ["[telugu]", "telugu:", "అ:", "ఆ:"],  # Android TTS markers
-            "ta": ["[tamil]", "tamil:", "அ:", "ஆ:"],    # Android TTS markers
-            "kn": ["[kannada]", "kannada:", "ಅ:", "ಆ:"],  # Android TTS markers
-            "ml": ["[malayalam]", "malayalam:", "അ:", "ആ:"],  # Android TTS markers
-        }
-        
-        # Remove ONLY exact hallucinations (with context-aware rules)
-        for halluc in hallucinations_si.get(lang_code, []):
-            text = text.replace(halluc, "")
-        
-        # Fix excessive spaces (very common in segment joining)
-        # But preserve the stutter patterns (i... i..., b-b-ball)
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        return text
-    except Exception as e:
-        logger.warning(f"⚠️ South Indian text normalization failed: {e}")
-        return text
-
-
-def generate_fallback_translation(text: str, lang_code: str) -> str:
-    """
-    Generate a basic English translation for fallback cases when AI analysis fails.
-    This provides readable text for South Indian languages in the UI.
-    """
-    if not text or lang_code not in {"ta", "kn", "ml", "hi", "te"}:
-        return ""
-    
-    try:
-        # Basic fallback translations for common phrases
-        fallback_translations = {
-            "te": {  # Telugu
-                "నేను": "I",
-                "నాకు": "to me",
-                "వెళ్ళాలి": "should go",
-                "చాలు": "enough",
-                "ఏమి": "what",
-                "ఎందుకు": "why",
-                "ఎక్కడ": "where",
-                "ఎప్పుడు": "when",
-                "ఎలా": "how",
-            },
-            "ta": {  # Tamil
-                "நான்": "I",
-                "எனக்கு": "to me",
-                "போகணும்": "should go",
-                "போதும்": "enough",
-                "என்ன": "what",
-                "ஏன்": "why",
-                "எங்கே": "where",
-                "எப்போது": "when",
-                "எப்படி": "how",
-            },
-            "kn": {  # Kannada
-                "ನಾನು": "I",
-                "ನನಗೆ": "to me",
-                "ಹೋಗಬೇಕು": "should go",
-                "ಸಾಕು": "enough",
-                "ಏನು": "what",
-                "ಯಾಕೆ": "why",
-                "ಎಲ್ಲಿದೆ": "where",
-                "ಯಾವಾಗ": "when",
-                "ಹೇಗೆ": "how",
-            },
-            "ml": {  # Malayalam
-                "ഞാൻ": "I",
-                "എനിക്ക്": "to me",
-                "പോകണം": "should go",
-                "മതി": "enough",
-                "എന്ത്": "what",
-                "എന്തുകൊണ്ട്": "why",
-                "എവിടെ": "where",
-                "എപ്പോൾ": "when",
-                "എങ്ങനെ": "how",
-            },
-            "hi": {  # Hindi
-                "मैं": "I",
-                "मुझे": "to me",
-                "जाना चाहिए": "should go",
-                "काफी": "enough",
-                "क्या": "what",
-                "क्यों": "why",
-                "कहाँ": "where",
-                "कब": "when",
-                "कैसे": "how",
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fluency-Net AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Sora', 'sans-serif'] },
+                    colors: {
+                        primary: '#8b5cf6', // Violet 500
+                        secondary: '#06b6d4', // Cyan 500
+                        darkbg: '#0f172a', // Slate 900
+                        darkpanel: '#1e293b', // Slate 800
+                    },
+                    animation: {
+                        'fade-in': 'fadeIn 0.5s ease-out',
+                        'slide-in-right': 'slideInRight 0.3s ease-out',
+                        'float': 'float 10s infinite ease-in-out alternate',
+                    },
+                    keyframes: {
+                        fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
+                        slideInRight: { '0%': { transform: 'translateX(20px)', opacity: '0' }, '100%': { transform: 'translateX(0)', opacity: '1' } },
+                        float: { '0%': { transform: 'translate(0, 0) rotate(0deg)' }, '100%': { transform: 'translate(30px, 50px) rotate(10deg)' } }
+                    }
+                }
             }
         }
+    </script>
+    <style>
+        /* Custom Scrollbar for Webkit */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background-color: rgba(156, 163, 175, 0.5); border-radius: 20px; }
+        .dark ::-webkit-scrollbar-thumb { background-color: rgba(71, 85, 105, 0.5); }
         
-        # Simple word-by-word translation for basic understanding
-        words = text.split()
-        translations = []
-        
-        for word in words:
-            # Remove common stutter markers for translation lookup
-            clean_word = re.sub(r'[-\.]{2,}', '', word).strip()
-            translation = fallback_translations.get(lang_code, {}).get(clean_word, f"[{clean_word}]")
-            translations.append(translation)
-        
-        return " ".join(translations)
-        
-    except Exception as e:
-        logger.warning(f"⚠️ Fallback translation failed: {e}")
-        return f"[Translation unavailable - {LANGUAGE_NAMES.get(lang_code, lang_code)} text]"
-
-
-def query_groq_api(prompt: str, system_prompt: str) -> Optional[str]:
-    """Uses Groq API (Llama 3 70B) for ultra-low latency intelligence."""
-    if not GROQ_API_KEY:
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"}
-    }
-
-    try:
-        session = get_requests_session()
-        response = session.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=GROQ_TIMEOUT)
-        response.raise_for_status()
-        json_response = response.json()
-        if isinstance(json_response, dict) and 'choices' in json_response and len(json_response['choices']) > 0:
-            message = json_response['choices'][0].get('message', {})
-            if isinstance(message, dict):
-                content = message.get('content')
-                if isinstance(content, str):
-                    return content
-        logger.error(f"❌ Groq API returned unexpected structure: {json_response}")
-        return None
-    except requests.exceptions.RequestException as e:
-        error_details = f" | Details: {e.response.text}" if getattr(e, 'response', None) is not None else ""
-        logger.error(f"❌ Groq API request failed: {e}{error_details}")
-        return None
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ Failed to decode Groq JSON response: {e} | Response text: {response.text}")
-        return None
-    except Exception as e:
-        logger.error(f"❌ Groq API response parsing failed: {e}")
-        return None
-
-def get_script_constraint(transcript: str) -> str:
-    """
-    Returns a strict system prompt constraint.
-    Currently empty to allow the main prompt's multilingual instructions to take precedence.
-    """
-    return ""
-
-# --- Fallback Fluency Helpers ---
-FILLER_WORDS = {"um", "uh", "ah", "er", "eh", "hmm", "mm", "like", "you know", "so", "well", "okay", "ok"}
-
-def clean_stuttered_text(text: str) -> (str, dict):
-    """Quick heuristic to remove common stuttering artifacts and compute basic metrics.
-
-    This is used as a resilient fallback when the AI analysis is slow, times out,
-    or fails. It provides a fluent approximation of the user's intended speech.
-    """
-    if not text:
-        return "", {"words": 0, "disfluencies": 0, "rate": 100}
-
-    # Preserve whitespace so we don't collapse user pacing too much.
-    tokens = re.split(r"(\s+)", text)
-    cleaned_tokens = []
-    disfluencies = 0
-    prev_word = None
-
-    def normalize_token(tok: str) -> str:
-        return tok.strip(" .,-—–…")
-
-    for tok in tokens:
-        if tok.isspace():
-            cleaned_tokens.append(tok)
-            continue
-
-        # Count and remove explicit block indicators like '...' or '---'
-        if re.fullmatch(r"[\.\-–—]+", tok):
-            disfluencies += 1
-            continue
-
-        # Handle stutter patterns like 'b-b-ball' or 'I... I...'
-        segments = re.split(r"[-\.]{1,3}", tok)
-        if len(segments) > 1:
-            candidate = max(segments, key=len)
-            if candidate and candidate != tok:
-                disfluencies += 1
-            tok = candidate
-
-        stripped = normalize_token(tok)
-        if not stripped:
-            continue
-
-        low = stripped.lower()
-        if low in FILLER_WORDS:
-            disfluencies += 1
-            continue
-
-        # Word repetition disfluency (e.g., "I I" or "I, I")
-        if prev_word and low == prev_word.lower():
-            disfluencies += 1
-            continue
-
-        # Prolongation detection (e.g., "ssssss")
-        if len(stripped) > 2 and len(set(stripped)) == 1:
-            disfluencies += 1
-            continue
-
-        cleaned_tokens.append(tok)
-        prev_word = stripped
-
-    cleaned_text = "".join(cleaned_tokens).strip()
-    word_count = len(re.findall(r"\b\w+\b", text, flags=re.UNICODE))
-    rate = 100
-    if word_count > 0:
-        rate = max(0, min(100, int(100 - (disfluencies / word_count * 100))))
-
-    metrics = {"words": word_count, "disfluencies": disfluencies, "rate": rate}
-    return cleaned_text, metrics
-
-
-def detect_language_voting(whisper_lang: str, transcript: str) -> str:
-    """
-    Simplified for English-only focus. Always returns 'en'.
-    """
-    return 'en'
-
-
-def normalize_language_name_to_code(language_name: str) -> str:
-    """Map a language name (e.g., 'Hindi') to its ISO 639-1 code (e.g., 'hi')."""
-    if not language_name:
-        return ""
-
-    lang_lower = language_name.strip().lower()
-
-    # Direct match against supported ISO codes
-    if lang_lower in SUPPORTED_LANGUAGES:
-        return lang_lower
-
-    # Match against friendly language names (e.g. "Hindi" -> "hi")
-    for code, friendly in LANGUAGE_NAMES.items():
-        if lang_lower == friendly.lower():
-            return code
-
-    return lang_lower
-
-
-def should_prefer_cloud(language_name: str) -> bool:
-    """Decide whether Groq (cloud) should be preferred for a given language."""
-    if not GROQ_API_KEY:
-        return False
-
-    if FORCE_GROQ or GROQ_ONLY:
-        return True
-
-    lang_code = normalize_language_name_to_code(language_name)
-
-    # South Indian languages are often weak in local Ollama models; prefer Groq when available.
-    if lang_code in SOUTH_INDIAN_LANGS:
-        return True
-
-    # Complex languages like Hindi can also benefit from Groq for stable results.
-    return lang_code in COMPLEX_LANGUAGES
-
-
-def knowledge_agent_client(prompt: str, language: str = "English", tone: str = "Professional", session_id: str = None, acoustic_features: dict = None, analysis_mode: str = "balanced", prefer_cloud: bool = False):
-    # Sanitize prompt to prevent JSON injection
-    safe_prompt = json.dumps(prompt)[1:-1]
-
-    # --- Agentic AI Logic: Perception -> State Update -> Goal Selection -> Action ---
-    if not session_id:
-        session_id = "default"
-
-    # Load state from DB or create new
-    agent_state = load_session(session_id)
-    if not agent_state:
-        agent_state = AgentInternalState(session_id=session_id)
-
-    # Cleanup old sessions from DB (Optional: run periodically)
-    # with sqlite3.connect(DB_PATH) as conn:
-    #     conn.execute("DELETE FROM sessions WHERE last_interaction < ?", (time.time() - 86400 * 7,))
-
-    agent_goal = determine_agent_goal(agent_state)
-    
-    # Construct Prompt with Goal & History
-    history_str = "\n".join([f"User: {turn['user']}\nAssistant: {turn['assistant']}" for turn in agent_state.history[-3:]])
-    
-    acoustic_context = ""
-    if acoustic_features:
-        # Check if features are essentially zero (Text Input/Regeneration)
-        if acoustic_features.get('rms', 0) == 0 and acoustic_features.get('zcr', 0) == 0:
-             acoustic_context = "\nNOTE: This is TEXT-ONLY input. Do not analyze voice quality, pitch, or tone. Focus ONLY on the text content, grammar, and disfluencies represented in the text (e.g. 'I... I...')."
-        else:
-             acoustic_context = f"\nACOUSTIC FEATURES: Energy(RMS)={acoustic_features.get('rms',0):.3f}, ZeroCrossingRate={acoustic_features.get('zcr',0):.3f}, Pitch(F0)={acoustic_features.get('f0',0):.1f}Hz (Sudden pitch rises indicate tension/struggle)."
-
-    script_constraint = get_script_constraint(prompt)
-
-    full_prompt = (
-        f"The user is speaking in {language}. Tone: {tone}.{acoustic_context}\n"
-        f"CURRENT AGENT GOAL: {agent_goal.current_goal}\n"
-        f"STRATEGY: {agent_goal.tactical_instruction}\n\n"
-        f"--- HISTORY (FOR CONTEXT ONLY - DO NOT ANALYZE) ---\n{history_str}\n--- END HISTORY ---\n\n"
-        f"--- CURRENT INPUT (ANALYZE THIS TEXT ONLY) ---\n{safe_prompt}\n--- END CURRENT INPUT ---\n\n"
-        f"TASK: Analyze ONLY the text inside 'CURRENT INPUT' and return a valid JSON object. For the 'text' field, reconstruct the user's intended fluent speech.\n"
-        f"{script_constraint}\n"
-        f"If the input is code-switched (Mixed Languages), preserve the mix. Do not normalize the entire sentence into a single language. Focus only on removing the stutters within each language segment.\n"
-        f"Remove all stutters/stammers but keep the user's intended words exactly as they meant to say them.\nCRITICAL: In 'analysis', ONLY cite words from the CURRENT INPUT. Do not analyze history."
-    )
-    
-    # Decide whether to prefer cloud (Groq) for this language.
-    # Use local Ollama only when Groq is unavailable or when cloud fails and not CLOUD_ONLY.
-    cloud_first = prefer_cloud or should_prefer_cloud(language)
-    cloud_only = FORCE_GROQ or GROQ_ONLY or CLOUD_ONLY
-
-    def run_local():
-        agent = get_ai_agent(analysis_mode)
-        logger.info(f"🚀 Using local Ollama ({agent.model.id if hasattr(agent, 'model') else 'unknown'}) for {language} analysis...")
-        response = agent.run(full_prompt, stream=False, response_model=SpeechAnalysis)
-
-        if hasattr(response, "content") and isinstance(response.content, SpeechAnalysis):
-            data_local = response.content.model_dump()
-        else:
-            content = response.content if hasattr(response, "content") else str(response)
-            data_local = extract_json_from_text(content, prompt)
-
-        agent_state.update_model(prompt, data_local)
-        save_session(agent_state)
-        agent_state.last_strategy = agent_goal.current_goal
-        return data_local
-
-    def run_cloud():
-        if not GROQ_API_KEY:
-            raise RuntimeError("Groq API key missing")
-
-        logger.info("🚀 Using Groq (Cloud) for analysis...")
-        system_instructions = knowledge_agent_ai.instructions
-        if isinstance(system_instructions, list):
-            system_instructions = "\n".join(system_instructions)
-
-        groq_content = query_groq_api(full_prompt, system_instructions)
-        if not groq_content:
-            raise RuntimeError("Groq returned no content")
-
-        data_cloud = extract_json_from_text(groq_content, prompt)
-        agent_state.update_model(prompt, data_cloud)
-        save_session(agent_state)
-        agent_state.last_strategy = agent_goal.current_goal
-        return data_cloud
-
-    # Try preferred path first, then fall back.
-    if cloud_first:
-        try:
-            return run_cloud()
-        except Exception as e:
-            logger.warning(f"⚠️ Cloud (Groq) call failed for language '{language}', error: {e}")
-            if cloud_only:
-                logger.error("❌ Cloud-only mode active; not falling back to local Ollama.")
-            else:
-                try:
-                    logger.info("🔁 Falling back to local Ollama (non-cloud-only mode).")
-                    return run_local()
-                except Exception as e2:
-                    logger.error(f"❌ Local Ollama call failed after cloud fallback: {e2}")
-    else:
-        try:
-            return run_local()
-        except Exception as e:
-            logger.warning(f"⚠️ Local Ollama call failed, falling back to cloud (Groq): {e}")
-            try:
-                return run_cloud()
-            except Exception as e2:
-                logger.error(f"❌ Groq fallback failed: {e2}")
-
-    # --- FINAL FALLBACK: If both local and cloud fail ---
-    logger.error("ℹ️ All AI models failed. Returning fallback.")
-    return {
-        "text": prompt,
-        "english_translation": "",
-        "metrics": {"words": len(prompt.split()), "disfluencies": 0, "rate": 0},
-        "analysis": "<ul><li><strong>Processing Error</strong>: The AI analysis failed. Please check server logs.</li></ul>",
-        "suggestions": "<ul><li>Try recording again with clearer speech.</li></ul>",
-        "soap": {"s": "-", "o": "-", "a": "Processing Error", "p": "Retry"},
-        "level": "Error",
-        "classification": "Processing Failure",
-        "demographics": "Unknown"
-    }
-
-# --- Global Requests Session for Connection Pooling ---
-# This improves performance and reliability for repeated HTTP requests (e.g., Groq API)
-_requests_session = None
-
-def get_requests_session():
-    """Get or create a global requests session with connection pooling."""
-    global _requests_session
-    if _requests_session is None:
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-        
-        _requests_session = requests.Session()
-        
-        # Configure retry strategy with exponential backoff
-        retry_strategy = Retry(
-            total=2,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],
-            backoff_factor=0.5
-        )
-        
-        # Mount adapters for both HTTP and HTTPS with connection pooling
-        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
-        _requests_session.mount("http://", adapter)
-        _requests_session.mount("https://", adapter)
-    
-    return _requests_session
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Clean up temporary files on startup to prevent disk clutter."""
-    init_db() # Initialize DB
-    # Initialize requests session with connection pooling
-    get_requests_session()
-    logger.info("🔌 Requests session initialized with connection pooling (10 connections, 2 retries with exponential backoff)")
-    if os.path.exists("temp"):
-        now = time.time()
-        for filename in os.listdir("temp"):
-            file_path = os.path.join("temp", filename)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    if os.path.getmtime(file_path) < now - 86400:
-                        os.unlink(file_path)
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to delete temp file {file_path}: {e}")
-    yield
-
-app = FastAPI(title="Fluency-Net", lifespan=lifespan)
-templates = Jinja2Templates(directory=".")
-
-# Enable CORS to prevent frontend connection issues
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # Allow ALL origins (safest for local dev)
-    allow_credentials=False, # Disable credentials to allow wildcard origin
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Setup Static & Temp Directories ---
-os.makedirs("static", exist_ok=True)
-os.makedirs("temp", exist_ok=True)
-MODELS_DIR = "models"
-os.makedirs(MODELS_DIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-app.mount("/temp", StaticFiles(directory="temp"), name="temp")
-
-def check_and_download_models():
-    """Ensures Kokoro models are present and valid."""
-    models = [
-        ("https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx", "kokoro-v1.0.onnx"),
-        ("https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin", "voices-v1.0.bin")
-    ]
-    for url, filename in models:
-        file_path = os.path.join(MODELS_DIR, filename)
-        # Check if file exists and is larger than 1KB (to filter out corrupt/HTML files)
-        if not os.path.exists(file_path) or os.path.getsize(file_path) < 1024:
-            logger.info(f"⬇️ Downloading missing model: {filename}...")
-            try:
-                temp_filename = file_path + ".tmp"
-                with requests.get(url, stream=True) as r:
-                    r.raise_for_status()
-                    with open(temp_filename, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                shutil.move(temp_filename, file_path)
-                logger.info(f"✅ Downloaded {filename}")
-            except Exception as e:
-                logger.error(f"❌ Failed to download {filename}: {e}")
-                if os.path.exists(temp_filename):
-                    os.remove(temp_filename)
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-
-# --- Initialize Models ---
-# Configure eSpeak NG for Windows if not in PATH (Required for Kokoro)
-if sys.platform == "win32" and shutil.which("espeak-ng") is None:
-    possible_paths = [
-        r"C:\Program Files\eSpeak NG\espeak-ng.exe",
-        r"C:\Program Files (x86)\eSpeak NG\espeak-ng.exe"
-    ]
-    for path in possible_paths:
-        if os.path.exists(path):
-            logger.info(f"ℹ️  Found eSpeak NG at: {path}")
-            os.environ["PHONEMIZER_ESPEAK_PATH"] = path
-            # Also add to PATH for subprocess calls
-            os.environ["PATH"] += f";{os.path.dirname(path)}"
-            break
-
-check_and_download_models()
-kokoro = None
-if not CLOUD_ONLY:
-    check_and_download_models()
-    try:
-        kokoro = Kokoro(os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"), os.path.join(MODELS_DIR, "voices-v1.0.bin"))
-    except Exception as e:
-        logger.error(f"⚠️ Kokoro initialization failed: {e}")
-        logger.info("ℹ️  Deleting potentially corrupt model files. They will be re-downloaded on next run.")
-        if os.path.exists(os.path.join(MODELS_DIR, "kokoro-v1.0.onnx")): os.remove(os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"))
-        if os.path.exists(os.path.join(MODELS_DIR, "voices-v1.0.bin")): os.remove(os.path.join(MODELS_DIR, "voices-v1.0.bin"))
-else:
-    logger.info("☁️ CLOUD_ONLY mode: Skipping Kokoro TTS model load to save memory.")
-
-# Initialize Whisper (Load once)
-whisper_model = None
-if not CLOUD_ONLY:
-    whisper_model_size = TIER_CONFIG.get(ACTIVE_TIER, {}).get("whisper_model", "base")
-    print(f"⏳ Loading Whisper '{whisper_model_size}' model with INT8 Quantization... (This may take a few minutes on first run)")
-    try:
-        # Changed device="cpu" to device="auto" for massive latency reduction on supported hardware
-        whisper_model = WhisperModel(whisper_model_size, device="auto", compute_type="int8")
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to load Whisper model on auto device: {e}. Falling back to CPU...")
-        try:
-            whisper_model = WhisperModel(whisper_model_size, device="cpu", compute_type="int8")
-        except Exception as e2:
-            logger.error(f"❌ Failed to load Whisper model: {e2}")
-else:
-    logger.info("☁️ CLOUD_ONLY mode: Skipping local Whisper model load to save memory.")
-
-# --- Internationalization (i18n) ---
-translations = {
-    "en": {
-        "title": "Stutter2Fluent",
-        "header": "🎙️ Stutter2Fluent",
-        "subheader": "Real-Time Speech-to-Speech AI Assistant",
-        "start_button": "Start Recording",
-        "stop_button": "Stop Recording",
-        "status_ready": "Ready to connect...",
-        "status_connected": "🔴 Connected & Listening...",
-        "status_disconnected": "Disconnected",
-        "status_stopped": "⏹️ Stopped",
-        "transcription_placeholder": "Transcription will appear here...",
-    },
-}
-
-@app.get("/")
-async def get(request: Request, lang: str = "en"):
-    lang_code = lang if lang in translations else "en"
-    return templates.TemplateResponse("index.html", {"request": request, "translations": translations[lang_code]})
-
-@app.get("/voices")
-async def get_voices():
-    """Endpoint to return available voices, preventing 404 errors in the UI."""
-    # The frontend expects a dictionary mapping language codes to a list of voices.
-    return {
-        "en": [
-            {"id": "af_heart", "name": "Heart (US English)"},
-            {"id": "en-US-ChristopherNeural", "name": "Christopher (US English)"},
-            {"id": "en-US-JennyNeural", "name": "Jenny (US English)"},
-        ],
-        "hi": [
-            {"id": "hi-IN-MadhurNeural", "name": "Madhur (Hindi - Male)"},
-            {"id": "hi-IN-SwaraNeural", "name": "Swara (Hindi - Female)"}
-        ],
-        "te": [
-            {"id": "te-IN-MohanNeural", "name": "Mohan (Telugu - Male)"},
-            {"id": "te-IN-ShrutiNeural", "name": "Shruti (Telugu - Female)"}
-        ],
-        "ta": [
-            {"id": "ta-IN-ValluvarNeural", "name": "Valluvar (Tamil - Male)"},
-            {"id": "ta-IN-PallaviNeural", "name": "Pallavi (Tamil - Female)"}
-        ],
-        "kn": [
-            {"id": "kn-IN-GaganNeural", "name": "Gagan (Kannada - Male)"},
-            {"id": "kn-IN-SapnaNeural", "name": "Sapna (Kannada - Female)"}
-        ],
-        "ml": [
-            {"id": "ml-IN-MidhunNeural", "name": "Midhun (Malayalam - Male)"},
-            {"id": "ml-IN-SobhanaNeural", "name": "Sobhana (Malayalam - Female)"}
-        ]
-    }
-
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return Response(status_code=204)
-
-@app.post("/api/process")
-async def api_process(
-    file: UploadFile = File(...),
-    voice: Optional[str] = Form(None),
-    tone: str = Form("Professional"),
-    speed: float = Form(1.0),
-    analysis_mode: str = Form("balanced"),
-    language: str = Form("auto"),
-    session_id: str = Form(None)
-):
-    # Check if this is a regeneration request.
-    # We check content_type OR if the filename ends with .txt (fallback)
-    is_text_input = file.content_type == 'text/plain' or file.filename.endswith('.txt')
-    
-    if is_text_input:
-        logger.info("Processing text input from upload.")
-        file_bytes = await file.read()
-        if len(file_bytes) == 0:
-            raise HTTPException(status_code=400, detail="Uploaded text file is empty.")
-        return await process_audio_pipeline(file_bytes, language, voice, speed, tone, session_id, analysis_mode, is_text_input=True, mime_type=file.content_type)
-    
-    # For audio, save to temp file to handle large sizes without memory limits
-    # Ensure filename has extension (crucial for blobs/recordings)
-    logger.info(f"Processing file upload: {file.filename} ({file.content_type})")
-    filename = os.path.basename(file.filename)
-    if not os.path.splitext(filename)[1]:
-        ext = mimetypes.guess_extension(file.content_type)
-        if ext:
-            filename += ext
-    temp_filename = f"temp/{uuid.uuid4()}_{filename}"
-    try:
-        loop = asyncio.get_running_loop()
-        def save_file_blocking():
-            with open(temp_filename, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-        await loop.run_in_executor(None, save_file_blocking)
-        return await process_audio_pipeline(temp_filename, language, voice, speed, tone, session_id, analysis_mode, mime_type=file.content_type)
-    finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-
-def get_voice_gender(voice_id: str) -> str:
-    """Heuristic to determine gender from voice ID for fallback logic."""
-    # Known female voices in the config
-    female_names = ["Heart", "Sonia", "Neerja", "Swara", "Shruti", "Sapna", "Sobhana", "Pallavi"]
-    if any(name in voice_id for name in female_names):
-        return "Female"
-    return "Male"
-
-async def generate_elevenlabs_audio(text: str, voice_id: str) -> Optional[str]:
-    """Generates audio using ElevenLabs API."""
-    if not ELEVENLABS_API_KEY: return None
-    
-    # Default to a nice therapeutic voice if specific ID not provided
-    # '21m00Tcm4TlvDq8ikWAM' is Rachel (American, Calm)
-    eleven_voice_id = "21m00Tcm4TlvDq8ikWAM" 
-    
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{eleven_voice_id}"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json"
-    }
-    data = {
-        "text": text,
-        "model_id": "eleven_flash_v2_5",
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
-    }
-    
-    try:
-        loop = asyncio.get_running_loop()
-        session = get_requests_session()
-        response = await loop.run_in_executor(None, lambda: session.post(url, json=data, headers=headers))
-        if response.status_code == 200:
-            filename = f"{uuid.uuid4()}.mp3"
-            filepath = f"temp/{filename}"
-            with open(filepath, "wb") as f:
-                f.write(response.content)
-            return f"/temp/{filename}"
-    except Exception as e:
-        logger.error(f"❌ ElevenLabs TTS failed: {e}")
-    return None
-
-async def tts_router(text: str, lang: str, voice_id: str = None, speed: float = SPEED) -> Optional[str]:
-    """Selects a TTS engine based on language and returns a URL to the generated audio file."""
-    logger.info(f"🎤 Routing TTS for language: {lang}, Voice: {voice_id}")
-
-    if not text or not text.strip():
-        print("⚠️ TTS received empty text. Skipping generation.")
-        return None
-
-    lang = lang.strip().lower()
-
-    DEFAULT_VOICES = {
-        "en": "af_heart",
-        "hi": "hi-IN-MadhurNeural",
-        "te": "te-IN-MohanNeural",
-        "ta": "ta-IN-ValluvarNeural",
-        "kn": "kn-IN-GaganNeural",
-        "ml": "ml-IN-MidhunNeural",
-    }
-
-    # Validate voice_id: if a voice is provided, it must be for the correct language.
-    # A voice is valid if its language code (e.g., 'en-' from 'en-US-JennyNeural') is in the target language.
-    is_valid_voice = False
-    if voice_id:
-        # Kokoro voices are special (af_...) and only for English
-        if voice_id.startswith("af_"):
-            if lang == "en":
-                is_valid_voice = True
-        # For EdgeTTS voices (e.g., 'en-US-JennyNeural'), check if the language prefix matches.
-        elif "-" in voice_id:
-            voice_lang_prefix = voice_id.split('-')[0].lower()
-            if voice_lang_prefix == lang:
-                is_valid_voice = True
-
-    if not is_valid_voice:
-        logger.warning(f"⚠️ Invalid or mismatched voice '{voice_id}' for language '{lang}'. Falling back to default.")
-        # Fallback to the default voice for the target language.
-        voice_id = DEFAULT_VOICES.get(lang, "en-US-ChristopherNeural") # Final fallback to a known good voice
-
-    # Check if we should use Kokoro (English only, model loaded, and voice is a Kokoro voice)
-    use_kokoro = lang == "en" and kokoro is not None and voice_id.startswith("af_")
-
-    audio_data = b""
-    mime_type = "audio/wav"
-
-    if use_kokoro:
-        logger.info(f"   🚀 Using Kokoro TTS (Local) - {voice_id}")
-        try:
-            # Run blocking Kokoro call in executor
-            loop = asyncio.get_running_loop()
-            samples, sample_rate = await loop.run_in_executor(None, lambda: kokoro.create(text, voice=voice_id, speed=speed, lang="en-us"))
-
-            # Convert Float32 to Int16 PCM for browser compatibility
-            if isinstance(samples, np.ndarray) and samples.dtype == np.float32:
-                samples = np.clip(samples, -1.0, 1.0)
-                samples = (samples * 32767).astype(np.int16)
-
-            # Write to in-memory buffer
-            buffer = io.BytesIO()
-            wav.write(buffer, sample_rate, samples)
-            audio_data = buffer.getvalue()
-        except Exception as e:
-            logger.error(f"❌ Local Kokoro TTS failed: {e}")
-            audio_data = b"" # Will trigger ElevenLabs Cloud fallback
-    else:
-        # Fallback: If voice_id is a Kokoro voice but we can't use Kokoro, switch to Edge-TTS default
-        if voice_id.startswith("af_"):
-            voice_id = "en-US-ChristopherNeural"
-
-        # Use edge-tts for other languages
-        logger.info(f"   🚀 Using edge-tts (Local) - {voice_id}")
-        rate_str = f"{int((speed - 1.0) * 100):+d}%"
-        try:
-            communicate = edge_tts.Communicate(text, voice_id, rate=rate_str)
-            # Stream to memory
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_data += chunk["data"]
-            mime_type = "audio/mpeg" # EdgeTTS outputs mp3 by default
-        except edge_tts.exceptions.NoAudioReceived:
-            logger.warning(f"⚠️ EdgeTTS NoAudioReceived with voice {voice_id}. Trying fallback voice...")
-
-            ALTERNATE_VOICES = {
-                "en": "en-US-JennyNeural",
-                "hi": "hi-IN-SwaraNeural",
-                "te": "te-IN-ShrutiNeural",
-                "ta": "ta-IN-PallaviNeural",
-                "kn": "kn-IN-SapnaNeural",
-                "ml": "ml-IN-SobhanaNeural"
-            }
-
-            # Smart Fallback: Try default voice for the language if the requested one fails
-            fallback_voice = DEFAULT_VOICES.get(lang, "en-US-ChristopherNeural")
-            if fallback_voice == voice_id:
-                fallback_voice = ALTERNATE_VOICES.get(lang, "en-US-JennyNeural")
-            if fallback_voice:
-                logger.info(f"🔄 Retrying with fallback voice: {fallback_voice}")
-                try:
-                    communicate = edge_tts.Communicate(text, fallback_voice, rate=rate_str)
-                    async for chunk in communicate.stream():
-                        if chunk["type"] == "audio":
-                            audio_data += chunk["data"]
-                    mime_type = "audio/mpeg"
-                except Exception as e2:
-                    logger.error(f"❌ Fallback EdgeTTS failed: {e2}") # audio_data will be empty
-            else:
-                pass # audio_data will be empty
-        except Exception as e:
-            logger.error(f"❌ EdgeTTS failed: {e}") # audio_data will be empty
-
-    if audio_data:
-        ext = ".mp3" if mime_type == "audio/mpeg" else ".wav"
-        filename = f"{uuid.uuid4()}{ext}"
-        filepath = f"temp/{filename}"
-        with open(filepath, "wb") as f:
-            f.write(audio_data)
-        return f"/temp/{filename}"
-
-    # --- CLOUD FALLBACK: ElevenLabs ---
-    if ELEVENLABS_API_KEY:
-        logger.warning("⚠️ Local TTS failed. Falling back to ElevenLabs (Cloud)...")
-        audio_url = await generate_elevenlabs_audio(text, voice_id)
-        if audio_url:
-            return audio_url
-
-    logger.error("❌ All TTS engines failed.")
-    return None
-
-@app.post("/process/upload")
-async def process_upload(
-    file: UploadFile = File(...), 
-    voice: Optional[str] = Form(None),
-    language: str = Form("auto"),
-    speed: float = Form(None),
-    analysis_mode: str = Form("balanced"),
-    tone: str = Form("Professional"),
-    session_id: str = Form(None)
-):
-    # Ensure filename has extension
-    filename = os.path.basename(file.filename)
-    if not os.path.splitext(filename)[1]:
-        ext = mimetypes.guess_extension(file.content_type)
-        if ext:
-            filename += ext
-            
-    # Check if text file
-    is_text = filename.lower().endswith(".txt") or file.content_type == "text/plain"
-    
-    temp_filename = f"temp/{uuid.uuid4()}_{filename}"
-    try:
-        loop = asyncio.get_running_loop()
-        def save_file_blocking():
-            with open(temp_filename, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            size_mb = os.path.getsize(temp_filename) / (1024 * 1024)
-            logger.info(f"📂 Received upload: {filename} ({size_mb:.2f} MB)")
-        await loop.run_in_executor(None, save_file_blocking)
-        return await process_audio_pipeline(temp_filename, language, voice, speed, tone, session_id, analysis_mode, is_text_input=is_text, mime_type=file.content_type)
-    finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-
-@app.post("/process/url")
-async def process_url(
-    url: str = Form(...), 
-    voice: Optional[str] = Form(None),
-    language: str = Form("auto"),
-    speed: float = Form(None),
-    analysis_mode: str = Form("balanced"),
-    tone: str = Form("Professional"),
-    session_id: str = Form(None)
-):
-    logger.info(f"Processing URL: {url}")
-    # Check for YouTube URLs which return HTML, not media
-    if "youtube.com" in url or "youtu.be" in url:
-        raise HTTPException(status_code=400, detail="YouTube URLs are not directly supported. Please provide a direct link to an audio/video file (e.g., ending in .mp3, .mp4).")
-
-    # Try to preserve extension from URL for correct MIME type detection
-    parsed_url = urllib.parse.urlparse(url)
-    path_filename = os.path.basename(parsed_url.path)
-    name, ext = os.path.splitext(path_filename)
-    if not ext:
-        ext = ".mp4" # Default to mp4 if unknown
-    temp_filename = f"temp/{uuid.uuid4()}_{name}{ext}"
-    try:
-        loop = asyncio.get_running_loop()
-        def download_stream():
-            # Use a browser-like User-Agent to avoid 403 Forbidden on some direct links
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            # Add size limit check (e.g., 50MB)
-            session = get_requests_session()
-            with session.get(url, stream=True, timeout=60, headers=headers) as r:
-                r.raise_for_status()
-                
-                content_length = r.headers.get('content-length')
-                if content_length and int(content_length) > 50 * 1024 * 1024:
-                    raise ValueError("File too large (Max 50MB)")
-                
-                # Validate Content-Type to prevent downloading HTML pages as media
-                content_type = r.headers.get('Content-Type', '').lower()
-                if 'text/html' in content_type:
-                    raise ValueError("The provided URL points to a webpage, not a media file. Please provide a direct link.")
-                
-                with open(temp_filename, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192): 
-                        f.write(chunk)
-        await loop.run_in_executor(None, download_stream)
-        mime_type = mimetypes.guess_type(temp_filename)[0] or "audio/wav"
-        return await process_audio_pipeline(temp_filename, language, voice, speed, tone, session_id, analysis_mode, mime_type=mime_type)
-    except Exception as e:
-        if isinstance(e, HTTPException): raise e
-        raise HTTPException(status_code=400, detail=f"Failed to download URL: {e}")
-    finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-
-@app.post("/process/regenerate")
-async def regenerate(
-    text: str = Form(...),
-    lang: str = Form(...),
-    voice: Optional[str] = Form(None)
-):
-    audio_url = await tts_router(text, lang, voice)
-    return {"audio_url": audio_url}
-
-@app.delete("/delete/{filename}")
-async def delete_file(filename: str):
-    path = f"temp/{filename}"
-    if os.path.exists(path):
-        os.remove(path)
-        return {"status": "deleted"}
-    return {"status": "not found"}
-
-
-SUPPORTED_EXTENSIONS = {
-    # Audio
-    '.mp3', '.wav', '.aac', '.flac', '.m4a', '.ogg', '.opus', '.wma',
-    # Video
-    '.mp4', '.mkv', '.mov', '.avi', '.webm', '.flv', '.wmv', '.mpeg', '.mpg', '.m4v', '.3gp'
-}
-
-def transcribe_with_deepgram(audio_data: Union[bytes, str], language: str = None, mimetype: str = "audio/wav") -> Optional[dict]:
-    """Transcribes audio using Deepgram Nova-3/Nova-2, with language-aware model selection."""
-    if not DEEPGRAM_API_KEY: return None
-
-    # Ensure mimetype is valid (Deepgram requires specific content-types)
-    if not mimetype or mimetype == "application/octet-stream":
-        mimetype = "audio/wav"
-
-    headers = {
-        "Authorization": f"Token {DEEPGRAM_API_KEY}",
-        "Content-Type": mimetype
-    }
-
-    # Prepare data once
-    try:
-        if isinstance(audio_data, str):
-            with open(audio_data, "rb") as f:
-                data = f.read()
-        else:
-            data = audio_data
-    except Exception as e:
-        logger.error(f"❌ Failed to read audio data for Deepgram: {e}")
-        return None
-
-    # Language-aware model selection: South Indian languages + complex scripts only work with nova-3
-    # For other languages/auto-detect, try nova-3 → nova-2 → general
-    if language and language in SOUTH_INDIAN_LANGS:
-        models = ["nova-3", "nova-2", "general"]  # Try nova-3 first, but allow fallback
-        logger.info(f"ℹ️  Trying nova-3 first for South Indian language: {language}, with fallbacks")
-    elif language and language in COMPLEX_LANGUAGES:
-        models = ["nova-3", "nova-2", "general"]  # Complex scripts (like Hindi) prefer nova-3, but allow fallback
-        logger.info(f"ℹ️  Trying nova-3 first for complex language: {language}, with fallbacks")
-    else:
-        models = ["nova-3", "nova-2", "general"]  # English and auto-detect: try all
-
-    for model in models:
-        params = {
-            "model": model,
-            "smart_format": "false", # Must be false, otherwise Deepgram deletes stutters/repetitions
-            "filler_words": "true",
-            "punctuate": "true",
+        /* Aurora Background */
+        .aurora-bg {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: -1;
+            background: #0f172a; overflow: hidden;
         }
-        if language and language != "auto":
-            params["language"] = language
-        else:
-            params["detect_language"] = "true"
+        .blob {
+            position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.4;
+            animation: float 10s infinite ease-in-out alternate;
+        }
+        .blob-1 { top: -10%; left: -10%; width: 50vw; height: 50vw; background: #4c1d95; animation-delay: 0s; }
+        .blob-2 { bottom: -10%; right: -10%; width: 50vw; height: 50vw; background: #0e7490; animation-delay: -5s; }
+        .blob-3 { top: 40%; left: 40%; width: 40vw; height: 40vw; background: #be185d; animation-delay: -2s; opacity: 0.2; }
 
-        url = f"https://api.deepgram.com/v1/listen?{urllib.parse.urlencode(params)}"
+        /* Glassmorphism */
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.7);
+            backdrop-filter: blur(20px) saturate(180%);
+            -webkit-backdrop-filter: blur(20px) saturate(180%);
+            border-left: 1px solid rgba(255, 255, 255, 0.3);
+        }
+        .dark .glass-panel {
+            background: rgba(15, 23, 42, 0.6);
+            border-left: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: -10px 0 30px rgba(0, 0, 0, 0.3);
+        }
 
-        response = None
-        try:
-            session = get_requests_session()
-            response = session.post(url, headers=headers, data=data, timeout=30)
-            response.raise_for_status()
-            result = response.json()
-            # Safely access the transcript
-            try:
-                transcript = result['results']['channels'][0]['alternatives'][0]['transcript']
-                if transcript: # Ensure transcript is not empty
-                    detected_lang = result['results']['channels'][0].get('detected_language', 'en')
-                    return {"text": transcript, "language": detected_lang}
-                else:
-                    logger.warning(f"⚠️ Deepgram returned an empty transcript for model '{model}'.")
-            except (KeyError, IndexError):
-                logger.warning(f"⚠️ Deepgram response for model '{model}' was malformed and did not contain a transcript.")
-                # Continue to next model
-        except requests.exceptions.HTTPError as e:
-            # Check if it's a model availability issue (400 Bad Request)
-            if response is not None and response.status_code == 400 and model != models[-1]:
-                logger.warning(f"⚠️ Deepgram model '{model}' failed (likely unsupported language). Retrying with fallback model...")
-                continue
+        /* Dynamic Pulse Wave */
+        .pulse-ring {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            border-radius: 50%; border: 2px solid rgba(139, 92, 246, 0.5);
+            box-shadow: 0 0 20px rgba(139, 92, 246, 0.2); opacity: 0;
+        }
+        .recording .pulse-ring { animation: ripple 2s cubic-bezier(0, 0.2, 0.8, 1) infinite; }
+        .recording .pulse-ring:nth-child(2) { animation-delay: -0.5s; }
+        .recording .pulse-ring:nth-child(3) { animation-delay: -1s; }
+        @keyframes ripple {
+            0% { width: 0; height: 0; opacity: 1; }
+            100% { width: 200%; height: 200%; opacity: 0; }
+        }
 
-            # If it's another error or we ran out of models
-            details = ""
-            if response is not None:
-                try:
-                    details = f" | Deepgram Response: {response.text}"
-                except: pass
-            logger.error(f"❌ Deepgram STT failed: {e}{details}")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Deepgram STT request failed: {e}")
-            return None # Exit on connection error, no need to retry other models
-        except json.JSONDecodeError as e:
-            details = ""
-            if response is not None:
-                details = f" | Response: {response.text[:200]}"
-            logger.error(f"❌ Failed to decode Deepgram JSON response (model: {model}): {e}{details}")
-
-    return None
-
-async def process_audio_pipeline(input_data: Union[bytes, str], lang_pref, voice_pref, speed_pref=None, tone_pref="Professional", session_id=None, analysis_mode="balanced", is_text_input=False, mime_type: str = "audio/wav"):
-    # Initialize URLs early for error safety across the entire function scope
-    input_audio_url = None
-    acoustic_features = {"rms": 0.0, "zcr": 0.0, "variance": 0.0}
-
-    try:
-        loop = asyncio.get_running_loop()
+        /* Bento Grid & Interactions */
+        .bento-btn { transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+        .bento-btn:active { transform: scale(0.98); }
+        .bento-btn.active {
+            background: rgba(139, 92, 246, 0.15);
+            border: 1px solid rgba(139, 92, 246, 0.5);
+            color: #8b5cf6;
+        }
+        .dark .bento-btn.active { color: #c4b5fd; border-color: rgba(139, 92, 246, 0.5); }
         
-        if isinstance(input_data, str) and os.path.exists(input_data):
-            # Check for supported format if not text input
-            if not is_text_input:
-                _, ext = os.path.splitext(input_data)
-                if ext.lower() not in SUPPORTED_EXTENSIONS and ext.lower() != ".txt":
-                    raise ValueError(f"Unsupported file format: {ext}. Please upload a valid audio or video file.")
+        .glass-bubble {
+            background: rgba(255, 255, 255, 0.8);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.5);
+        }
+        .dark .glass-bubble {
+            background: rgba(30, 41, 59, 0.7);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
 
-            # Convert system path to web URL (e.g. temp/file.mp4 -> /temp/file.mp4)
-            web_path = "/" + input_data.replace("\\", "/")
+        /* Analysis Content Styling */
+        .analysis-content ul { list-style-type: disc; padding-left: 1.25rem; margin-top: 0.5rem; margin-bottom: 0.5rem; }
+        .analysis-content li { margin-bottom: 0.25rem; }
+        .analysis-content strong { font-weight: 600; }
+        canvas#visualizer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 50%; pointer-events: none; opacity: 0.6; }
+    </style>
+</head>
+<body class="text-gray-800 dark:text-gray-200 transition-colors duration-300 h-screen overflow-hidden font-sans">
+
+    <!-- Aurora Background -->
+    <div class="aurora-bg">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <div class="flex h-full flex-row-reverse">
+        
+        <!-- RIGHT COLUMN: Control Center (Input Hub) -->
+        <div class="w-96 flex-shrink-0 glass-panel flex flex-col z-20">
             
-            input_audio_url = web_path
+            <!-- Header & Theme Toggle -->
+            <div class="p-6 border-b border-gray-200/20 dark:border-gray-700/30 flex justify-between items-center">
+                <div class="flex items-center gap-2">
+                    <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-primary to-secondary flex items-center justify-center text-white font-bold shadow-lg shadow-primary/30">FN</div>
+                    <h1 class="font-bold text-lg tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-gray-800 to-gray-600 dark:from-white dark:to-gray-400">Fluency-Net</h1>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="resetSettings()" class="p-2 rounded-full hover:bg-gray-200/50 dark:hover:bg-gray-700/50 transition-colors text-gray-500 dark:text-gray-400" title="Reset Settings">
+                        <i class="fas fa-undo"></i>
+                    </button>
+                    <button onclick="startNewSession()" class="p-2 rounded-full hover:bg-gray-200/50 dark:hover:bg-gray-700/50 transition-colors text-gray-500 dark:text-gray-400" title="Start New Session">
+                        <i class="fas fa-plus-square"></i>
+                    </button>
+                    <button onclick="clearChat()" class="p-2 rounded-full hover:bg-red-100/50 dark:hover:bg-red-900/30 transition-colors text-red-500 ml-1" title="Clear Chat" aria-label="Clear Chat History">
+                        <i class="fas fa-trash-alt"></i>
+                    </button>
+                </div>
+            </div>
 
-        if is_text_input:
-            logger.info("Pipeline started for TEXT input.")
-            # 1. Bypass Transcription for Text Input (Regeneration)
-            if isinstance(input_data, bytes):
-                transcribed_text = input_data.decode('utf-8')
-            else:
-                with open(input_data, "r", encoding="utf-8") as f:
-                    transcribed_text = f.read()
-            
-            if lang_pref == "auto":
-                if any('\u0900' <= c <= '\u097F' for c in transcribed_text): detected_lang = "hi"
-                elif any('\u0C00' <= c <= '\u0C7F' for c in transcribed_text): detected_lang = "te"
-                elif any('\u0B80' <= c <= '\u0BFF' for c in transcribed_text): detected_lang = "ta"
-                elif any('\u0C80' <= c <= '\u0CFF' for c in transcribed_text): detected_lang = "kn"
-                elif any('\u0D00' <= c <= '\u0D7F' for c in transcribed_text): detected_lang = "ml"
-                else: detected_lang = "en"
-            else:
-                detected_lang = lang_pref
-        else:
-            logger.info("Pipeline started for AUDIO/VIDEO input.")
-            # 1. Transcribe Audio & Extract Features (Parallel)
-            async def get_acoustic_features():
-                try:
-                    audio_source_for_decode = input_data
-                    if isinstance(input_data, bytes):
-                        audio_source_for_decode = io.BytesIO(input_data)
-
-                    # decode_audio handles file paths (str) and file-like objects (BytesIO)
-                    # Run in executor to avoid blocking main thread
-                    audio_np = await loop.run_in_executor(None, lambda: decode_audio(audio_source_for_decode, sampling_rate=16000))
-
-                    # Extract Acoustic Features (RMS, ZCR)
-                    features = extract_acoustic_features(audio_np)
-                    print(f"📊 Acoustic Features Extracted: RMS={features.get('rms',0):.3f}, ZCR={features.get('zcr',0):.3f}, F0={features.get('f0',0):.1f}Hz")
-                    del audio_np
-                    return features
-                except Exception as e:
-                    logger.warning(f"⚠️ Acoustic Feature Extraction failed: {e}")
-                    return {"rms": 0.0, "zcr": 0.0, "variance": 0.0, "f0": 0.0}
-
-            # Execute parallel
-            feature_task = asyncio.create_task(get_acoustic_features())
-
-            transcribed_text = ""
-            detected_lang = "en"
-            segments = []
-            info = None
-
-            # --- STT STRATEGY ---
-            # South Indian/Complex: Cloud First. English: Local First.
-            prefer_cloud_stt = False
-            if lang_pref != "auto" and (lang_pref in SOUTH_INDIAN_LANGS or lang_pref in COMPLEX_LANGUAGES) and DEEPGRAM_API_KEY:
-                prefer_cloud_stt = True
-            elif GROQ_ONLY or CLOUD_ONLY:
-                prefer_cloud_stt = True
+            <!-- Language Engine -->
+            <div class="p-6 space-y-6 overflow-y-auto flex-1">
                 
-            if prefer_cloud_stt:
-                logger.info(f"☁️ Preferring Cloud STT (Deepgram) for '{lang_pref}'...")
-                dg_result = await loop.run_in_executor(None, lambda: transcribe_with_deepgram(input_data, lang_pref, mime_type))
-                if dg_result and dg_result.get("text"):
-                    transcribed_text = dg_result["text"]
-                    detected_lang = dg_result.get("language", lang_pref)
-                    class DummyInfo: duration = 10.0
-                    info = DummyInfo()
-                    segments = [] # Cloud doesn't return local Whisper word segments
+                <!-- Voice Selector -->
+                <div class="space-y-2">
+                    <label class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Voice</label>
+                    <div class="relative flex gap-2">
+                        <select id="voiceSelect" class="w-full p-3 bg-white/50 dark:bg-gray-800/50 border border-gray-200/50 dark:border-gray-700/50 rounded-xl text-sm focus:ring-2 focus:ring-primary/50 focus:border-primary outline-none transition-all appearance-none backdrop-blur-sm">
+                        </select>
+                        <div class="absolute right-14 top-3 pointer-events-none text-gray-400"><i class="fas fa-chevron-down text-xs"></i></div>
+                        <button onclick="playVoiceSample()" class="p-3 bg-white/50 dark:bg-gray-800/50 border border-gray-200/50 dark:border-gray-700/50 rounded-xl text-primary hover:bg-primary hover:text-white transition-colors" title="Play Sample">
+                            <i class="fas fa-play text-xs"></i>
+                        </button>
+                    </div>
+                </div>
 
-            tiers_to_try = [ACTIVE_TIER]
-            if ACTIVE_TIER == "low_latency":
-                tiers_to_try.append("balanced")
-            elif ACTIVE_TIER == "balanced":
-                tiers_to_try.append("high_quality") # Fallback: Try beam search if greedy fails
+                <!-- Language Selector -->
+                <div class="space-y-2">
+                    <label class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Language</label>
+                    <div class="relative">
+                        <select id="languageSelect" class="w-full p-3 bg-white/50 dark:bg-gray-800/50 border border-gray-200/50 dark:border-gray-700/50 rounded-xl text-sm focus:ring-2 focus:ring-primary/50 focus:border-primary outline-none transition-all appearance-none backdrop-blur-sm">
+                            <option value="auto">Auto (Detect)</option>
+                            <option value="en">English</option>
+                            <option value="hi">Hindi</option>
+                            <option value="te">Telugu</option>
+                            <option value="ta">Tamil</option>
+                            <option value="kn">Kannada</option>
+                            <option value="ml">Malayalam</option>
+                        </select>
+                        <div class="absolute right-3 top-3 pointer-events-none text-gray-400"><i class="fas fa-chevron-down text-xs"></i></div>
+                    </div>
+                </div>
 
-            if not transcribed_text and whisper_model is not None:
-                if prefer_cloud_stt:
-                    logger.warning("⚠️ Cloud STT failed. Falling back to local Whisper...")
-                else:
-                    logger.info("💻 Preferring Local Whisper STT for English/Auto...")
+                <!-- Tone Selector -->
+                <div class="space-y-2">
+                    <label class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Tone</label>
+                    <div class="relative">
+                        <select id="toneSelect" class="w-full p-3 bg-white/50 dark:bg-gray-800/50 border border-gray-200/50 dark:border-gray-700/50 rounded-xl text-sm focus:ring-2 focus:ring-primary/50 focus:border-primary outline-none transition-all appearance-none backdrop-blur-sm">
+                            <option value="Professional">Professional</option>
+                            <option value="Friendly">Friendly</option>
+                            <option value="Empathetic">Empathetic</option>
+                        </select>
+                        <div class="absolute right-3 top-3 pointer-events-none text-gray-400"><i class="fas fa-chevron-down text-xs"></i></div>
+                    </div>
+                </div>
+
+                <!-- Speed Selector -->
+                <div class="space-y-2">
+                    <label class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Speed</label>
+                    <select id="speedSelect" class="w-full p-2.5 bg-white/50 dark:bg-gray-800/50 border border-gray-200/50 dark:border-gray-700/50 rounded-xl text-sm focus:ring-2 focus:ring-primary/50 outline-none">
+                        <option value="0.8">0.8x (Slow)</option>
+                        <option value="1.0">1.0x (Normal)</option>
+                        <option value="1.2" selected>1.2x (Fast)</option>
+                        <option value="1.5">1.5x (Faster)</option>
+                    </select>
+                </div>
+
+                <!-- Analysis Mode Selector (Latency vs Depth) -->
+                <div class="space-y-2">
+                    <label class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Analysis Mode</label>
+                    <select id="analysisModeSelect" class="w-full p-2.5 bg-white/50 dark:bg-gray-800/50 border border-gray-200/50 dark:border-gray-700/50 rounded-xl text-sm focus:ring-2 focus:ring-primary/50 outline-none">
+                        <option value="balanced" selected>⚖️ Balanced (Recommended)</option>
+                        <option value="speed">⚡ Speed (Low Latency)</option>
+                        <option value="deep">🧠 Deep Analysis (High Content)</option>
+                    </select>
+                </div>
+
+                <!-- Input Hub Tabs -->
+                <div class="mt-6">
+                    <label class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-3 block">Input Hub (Bento Grid)</label>
                     
-                for attempt_tier in tiers_to_try:
-                    def transcribe_blocking(tier):
-                        tier_settings = TIER_CONFIG.get(tier, TIER_CONFIG["low_latency"])
-                        current_no_speech_threshold = 0.6
-                        current_beam_size = tier_settings.get("beam_size", 5)
+                    <!-- Mode Switcher: Now includes Text -->
+                    <div class="flex bg-gray-200 dark:bg-gray-700 rounded-lg p-1 mb-4">
+                        <button onclick="setMode('audio')" id="mode-audio" class="flex-1 py-1.5 text-xs font-bold rounded-md bg-white dark:bg-gray-600 shadow-sm transition-all text-primary">Audio</button>
+                        <button onclick="setMode('video')" id="mode-video" class="flex-1 py-1.5 text-xs font-bold rounded-md text-gray-500 dark:text-gray-400 hover:bg-gray-300 dark:hover:bg-gray-600 transition-all">Video</button>
+                        <button onclick="setMode('text')" id="mode-text" class="flex-1 py-1.5 text-xs font-bold rounded-md text-gray-500 dark:text-gray-400 hover:bg-gray-300 dark:hover:bg-gray-600 transition-all">Text</button>
+                    </div>
 
-                        # Optimize VAD for South Indian languages and stuttered speech
-                        # NOTE: VAD only filters SILENCE (>min_silence_ms). Stutter patterns still have voice activity
-                        # and will NOT be removed. This only helps preserve word boundaries during silence gaps.
-                        # Stuttering blocks often manifest as long silent pauses. We MUST increase the silence duration
-                        # tolerance to 3000ms so VAD doesn't split a single stuttered sentence into broken segments.
-                        is_south_indian = lang_pref in SOUTH_INDIAN_LANGS
-                        min_silence_ms = 3000
-                        speech_pad_ms = 500 if is_south_indian else 400     # Preserve more speech context
+                    <div class="grid grid-cols-2 gap-2 mb-4">
+                        <button onclick="switchTab('record')" id="tab-record" class="bento-btn active p-3 rounded-xl border border-transparent bg-white/50 dark:bg-gray-800/50 text-sm font-medium text-gray-600 dark:text-gray-300 hover:bg-white dark:hover:bg-gray-700 flex flex-col items-center gap-1 transition-all">
+                            <i class="fas fa-microphone text-lg"></i> Record
+                        </button>
+                        <button onclick="switchTab('upload')" id="tab-upload" class="bento-btn p-3 rounded-xl border border-transparent bg-white/50 dark:bg-gray-800/50 text-sm font-medium text-gray-600 dark:text-gray-300 hover:bg-white dark:hover:bg-gray-700 flex flex-col items-center gap-1">
+                            <i class="fas fa-cloud-upload-alt text-lg"></i> Upload
+                        </button>
+                        <button onclick="switchTab('url')" id="tab-url" class="bento-btn p-3 rounded-xl border border-transparent bg-white/50 dark:bg-gray-800/50 text-sm font-medium text-gray-600 dark:text-gray-300 hover:bg-white dark:hover:bg-gray-700 flex flex-col items-center gap-1 col-span-2">
+                            <i class="fas fa-link text-lg"></i> URL
+                        </button>
+                    </div>
+
+                    <!-- Tab Contents -->
+                    <div class="relative min-h-[220px] bg-white/30 dark:bg-gray-800/30 rounded-2xl p-4 border border-white/20 dark:border-gray-700/30">
                         
-                        transcribe_kwargs = {
-                            "beam_size": current_beam_size,
-                            "best_of": 5,
-                            "patience": 2.0, # Allows deeper exploration of the audio signal
-                            "repetition_penalty": 1.0,
-                            "no_speech_threshold": current_no_speech_threshold,
-                            "compression_ratio_threshold": 10.0, # CRITICAL: Prevent Whisper from dropping heavy repetitions (e.g., "I I I I")
-                            "vad_filter": True, # Enabled VAD to eliminate disturbing background noises
-                            "vad_parameters": dict(min_silence_duration_ms=min_silence_ms, speech_pad_ms=speech_pad_ms), # Adaptive silence tolerance
-                            "word_timestamps": False,
-                            "condition_on_previous_text": False,
-                            "language": lang_pref if lang_pref != "auto" else None,
-                            "temperature": (0.0, 0.2, 0.4)
-                        }
-                        if lang_pref in PRIMING_PROMPTS:
-                            transcribe_kwargs["initial_prompt"] = PRIMING_PROMPTS[lang_pref]
+                        <!-- Record Tab -->
+                        <div id="content-record" class="tab-content absolute inset-0 flex flex-col items-center justify-center space-y-4 overflow-hidden rounded-2xl">
+                            <!-- Video Preview -->
+                            <div id="videoPreviewContainer" class="hidden absolute inset-0 bg-black z-0">
+                                <video id="videoPreview" autoplay muted playsinline class="w-full h-full object-cover transform scale-x-[-1] opacity-60"></video>
+                            </div>
 
-                        logger.info(f"🎤 Transcribing with Whisper ({whisper_model_size} model, tier={tier}, beam_size={current_beam_size})...")
-                        try:
-                            source = io.BytesIO(input_data) if isinstance(input_data, bytes) else input_data
-                            segments_gen, info = whisper_model.transcribe(source, **transcribe_kwargs)
-                            return list(segments_gen), info
-                        except Exception as e:
-                            logger.error(f"❌ Whisper Transcription Error: {e}")
-                            return [], None
+                            <!-- Countdown Overlay -->
+                            <div id="countdownOverlay" class="hidden absolute inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm transition-all">
+                                <span id="countdownText" class="text-8xl font-bold text-white animate-bounce drop-shadow-lg">3</span>
+                            </div>
 
-                    segments, info = await loop.run_in_executor(None, lambda tier=attempt_tier: transcribe_blocking(tier))
+                            <div class="relative z-10" id="recordContainer">
+                                <canvas id="visualizer" width="100" height="100"></canvas>
+                                <div class="pulse-ring"></div>
+                                <div class="pulse-ring"></div>
+                                <div class="pulse-ring"></div>
+                                <button id="recordBtn" class="w-20 h-20 rounded-full bg-gradient-to-r from-primary to-secondary text-white text-2xl shadow-xl shadow-primary/40 flex items-center justify-center transition-transform active:scale-95 z-10 relative" aria-label="Start or Stop Recording">
+                                    <i class="fas fa-microphone"></i>
+                                </button>
+                            </div>
+                            <p id="statusText" class="text-sm font-medium text-gray-500 dark:text-gray-400">Tap to start</p>
+                        </div>
 
-                    if info is None:
-                        logger.warning(f"⚠️ Tier {attempt_tier} failed (info is None). Retrying with next tier...")
-                        continue
+                        <!-- Upload Tab -->
+                        <div id="content-upload" class="tab-content hidden absolute inset-0 flex flex-col justify-center">
+                            <div class="border-2 border-dashed border-gray-300/50 dark:border-gray-600/50 rounded-xl p-6 text-center hover:border-primary transition-colors cursor-pointer" onclick="document.getElementById('fileInput').click()">
+                                <i class="fas fa-cloud-upload-alt text-3xl text-gray-400 mb-2"></i>
+                                <p class="text-sm text-gray-500">Click to upload audio</p>
+                                <p class="text-xs text-gray-400 mt-1">MP3, WAV, WEBM</p>
+                                <input type="file" id="fileInput" accept="audio/*" class="hidden" onchange="handleFileSelect(this)">
+                            </div>
+                            <div id="fileInfo" class="mt-2 text-xs text-center text-primary font-medium hidden"></div>
+                            <button onclick="processUpload(this)" class="mt-4 w-full bg-primary hover:bg-violet-600 text-white py-2 rounded-lg text-sm font-medium transition-colors shadow-lg shadow-primary/30">Analyze File</button>
+                        </div>
 
-                    # Improved segment concatenation for South Indian languages
-                    # NOTE: Using spaces between segments PRESERVES stutter patterns (i... i..., b-b-ball)
-                    # Without spaces, Whisper segments can merge into unrecognizable words
-                    # Preserve word boundaries by adding spaces between segments
-                    segment_texts = []
-                    for s in segments:
-                        text = s.text.strip() if hasattr(s, 'text') else str(s).strip()
-                        if text:  # Only add non-empty segments
-                            segment_texts.append(text)
-                    current_text = " ".join(segment_texts).strip()
-                    
-                    # Normalize text for South Indian languages to fix ONLY Whisper hallucinations
-                    # (does NOT remove stutter patterns - they are essential for analysis)
-                    current_text = normalize_south_indian_text(current_text, lang_pref)
+                        <!-- URL Tab -->
+                        <div id="content-url" class="tab-content hidden absolute inset-0 flex flex-col justify-center">
+                            <input type="text" id="urlInput" placeholder="Paste audio URL..." class="w-full p-3 bg-white/50 dark:bg-gray-900/50 border border-gray-200/50 dark:border-gray-700/50 rounded-lg text-sm focus:ring-2 focus:ring-primary outline-none mb-3">
+                            <button onclick="processUrl(this)" class="w-full bg-primary hover:bg-violet-600 text-white py-2 rounded-lg text-sm font-medium transition-colors shadow-lg shadow-primary/30">Analyze URL</button>
+                        </div>
 
-                    # Filter Whisper hallucinations and environmental tags
-                    current_text = re.sub(r'\[.*?\]', '', current_text)
-                    current_text = re.sub(r'\(.*?\)', '', current_text)
-                    
-                    if not current_text.strip():
-                        current_text = ""
+                        <!-- Text Tab -->
+                        <div id="content-text" class="tab-content hidden absolute inset-0 flex flex-col justify-center">
+                            <textarea id="textInput" placeholder="Type or paste text here..." class="w-full h-32 p-3 bg-white/50 dark:bg-gray-900/50 border border-gray-200/50 dark:border-gray-700/50 rounded-lg text-sm focus:ring-2 focus:ring-primary outline-none mb-3 resize-none"></textarea>
+                            <button onclick="processText(this)" class="w-full bg-primary hover:bg-violet-600 text-white py-2 rounded-lg text-sm font-medium transition-colors shadow-lg shadow-primary/30">Analyze Text</button>
+                        </div>
 
-                    if current_text:
-                        transcribed_text = current_text
-                        detected_lang = info.language
-                        break
-                    else:
-                        if attempt_tier != tiers_to_try[-1]:
-                            logger.warning(f"⚠️ Empty result with {attempt_tier} tier. Retrying with next tier...")
-                            continue
-            else:
-                logger.info("☁️ CLOUD_ONLY mode or Missing Whisper: Bypassing local Whisper.")
-
-            acoustic_features = await feature_task
-
-            # --- CLOUD FALLBACK STT (if local Whisper fails) ---
-            if not transcribed_text and DEEPGRAM_API_KEY and not prefer_cloud_stt:
-                logger.info("⚠️ Local Whisper STT failed. Falling back to Deepgram (Cloud)...")
-                dg_result = await loop.run_in_executor(None, lambda: transcribe_with_deepgram(input_data, lang_pref, mime_type))
-                if dg_result and dg_result.get("text"):
-                    transcribed_text = dg_result["text"]
-                    detected_lang = dg_result.get("language", "en")
-                    # Create a dummy `info` object so the pipeline doesn't fail later
-                    class DummyInfo: duration = 30.0
-                    info = DummyInfo()
-
-            if not transcribed_text:
-                raise ValueError("Audio transcription failed. The audio file might be corrupt or unsupported.")
-
-        # Handle empty transcription
-        if not transcribed_text:
-            logger.warning("⚠️ Whisper produced an empty transcription. Stopping pipeline.")
-            return {
-                "status": "error",
-                "message": "No speech was detected in the audio. Please try recording again.",
-                "input_audio_url": input_audio_url,
-                "input_text": "(No speech detected)",
-                "output_audio_url": None,
-                "output_text": "",
-                "analysis": {},
-                "response": {},
-                "metrics": {"wer": 1.0},
-                "detected_language": detected_lang,
-                "transcription": "(No speech detected)"
-            }
-
-        # Calculate dynamic speed based on articulation rate (ignoring stutter blocks)
-        input_wpm = 150 # Default
-        if not is_text_input:
-            speech_duration = 0
-            word_count = 0
-            for segment in segments:
-                if segment.words:
-                    for word in segment.words:
-                        speech_duration += (word.end - word.start)
-                        word_count += 1
+                    </div>
+                </div>
+            </div>
             
-            effective_duration = speech_duration if speech_duration > 0.5 else (info.duration if info else 10.0)
-            input_wpm = (word_count / effective_duration) * 60 if effective_duration > 0 else 150
-        
-        if speed_pref:
-            final_speed = float(speed_pref)
-        else:
-            final_speed = max(0.8, min(1.3, input_wpm / 150)) # Clamp speed to natural range
+            <!-- Footer -->
+            <div class="p-4 border-t border-gray-200/20 dark:border-gray-700/30 text-center">
+                <p class="text-xs text-gray-400">Powered by Ollama & Whisper</p>
+            </div>
+        </div>
 
-        # Memory Cleanup: Segments no longer needed
-        if 'segments' in locals(): del segments
-        gc.collect()
+        <!-- LEFT COLUMN: Output Feed (Workspace) -->
+        <div class="flex-1 flex flex-col h-full relative">
+            <div id="chatHistory" class="flex-1 overflow-y-auto p-8 space-y-8 z-10 scroll-smooth">
+                <!-- Empty State -->
+                <div id="emptyState" class="h-full flex flex-col items-center justify-center text-gray-400 dark:text-gray-500">
+                    <div class="w-24 h-24 glass-bubble rounded-full shadow-lg flex items-center justify-center mb-6 animate-bounce">
+                        <i class="fas fa-wave-square text-4xl text-primary"></i>
+                    </div>
+                    <h2 class="text-2xl font-bold text-gray-700 dark:text-gray-300 mb-2">Ready to Analyze</h2>
+                    <p class="text-center max-w-md">Select an input method from the control center on the right to begin your speech therapy session.</p>
+                </div>
+            </div>
+        </div>
 
-        # --- Improved Language Auto-Detection Logic ---
-        final_lang = detected_lang if lang_pref == "auto" else lang_pref
-        logger.info(f"🔍 Language set to: '{final_lang}'")
+    </div>
 
-        # Map code to full name for Agent (e.g., "te" -> "Telugu") for better LLM accuracy
-        agent_lang_name = LANGUAGE_NAMES.get(final_lang, final_lang)
+    <script>
+        let currentMode = 'audio';
 
-        # Normalize analysis mode (front-end uses 'speed'/'deep' labels)
-        analysis_mode_normalized = str(analysis_mode).lower() if analysis_mode else "balanced"
-        if analysis_mode_normalized in ("speed", "fast", "low_latency"):
-            analysis_mode = "low_latency"
-        elif analysis_mode_normalized in ("deep", "high", "high_quality"):
-            analysis_mode = "high_quality"
-        else:
-            analysis_mode = "balanced"
+        function setMode(mode) {
+            currentMode = mode;
+            
+            // Visual Toggles
+            const audioBtn = document.getElementById('mode-audio');
+            const videoBtn = document.getElementById('mode-video');
+            const textBtn = document.getElementById('mode-text');
+            
+            const activeClasses = ['bg-white', 'dark:bg-gray-600', 'shadow-sm', 'text-primary'];
+            const inactiveClasses = ['text-gray-500', 'dark:text-gray-400', 'hover:bg-gray-300', 'dark:hover:bg-gray-600'];
 
-        # 2. AI Analysis
-        # Run blocking AI call in a separate thread to prevent server freeze
-        logger.info(f"Running AI analysis for language '{agent_lang_name}' (mode={analysis_mode})...")
+            // Reset all
+            [audioBtn, videoBtn, textBtn].forEach(btn => {
+                btn.classList.remove(...activeClasses);
+                btn.classList.add(...inactiveClasses);
+            });
 
-        # Get timeout for the current analysis mode (configurable via environment variables)
-        timeout_secs = OLLAMA_TIMEOUTS.get(analysis_mode, 20)
-
-        try:
-            ai_data = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: knowledge_agent_client(
-                    transcribed_text,
-                    language=agent_lang_name,
-                    tone=tone_pref,
-                    session_id=session_id,
-                    acoustic_features=acoustic_features,
-                    analysis_mode=analysis_mode,
-                    prefer_cloud=should_prefer_cloud(agent_lang_name)
-                )),
-
-                timeout=timeout_secs,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"⏱️ AI analysis timed out after {timeout_secs}s (mode={analysis_mode}). Attempting cloud fallback if available.")
-            ai_data = None
-        except Exception as e:
-            logger.warning(f"⚠️ AI analysis failed abruptly: {e}. Attempting cloud fallback if available.")
-            ai_data = None
-
-        # Universal fallback to cloud if the local Llama path failed or timed out.
-        if not ai_data and GROQ_API_KEY:
-            fallback_timeout = max(int(timeout_secs * CLOUD_FALLBACK_TIMEOUT_MULTIPLIER), CLOUD_FALLBACK_MIN_TIMEOUT)
-            logger.info(f"⏭️ Trying cloud fallback (Groq) with {fallback_timeout}s timeout...")
-            try:
-                ai_data = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: knowledge_agent_client(
-                        transcribed_text,
-                        language=agent_lang_name,
-                        tone=tone_pref,
-                        session_id=session_id,
-                        acoustic_features=acoustic_features,
-                        analysis_mode=analysis_mode,
-                        prefer_cloud=True
-                    )),
-                    timeout=fallback_timeout,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"⏱️ Cloud fallback also timed out after {fallback_timeout}s. Returning minimal response.")
-            except Exception as e:
-                logger.error(f"❌ Cloud fallback (Groq) failed: {e}")
-
-        if not ai_data:
-            # Absolute Final Fallback if everything is broken
-            fallback_text, fallback_metrics = clean_stuttered_text(transcribed_text)
-            ai_data = {
-                "text": fallback_text or transcribed_text,
-                "english_translation": generate_fallback_translation(transcribed_text, detected_lang),
-                "analysis": "<ul><li><strong>AI Processing Unavailable</strong>: The LLM model timed out or encountered an error. A basic heuristic filter was applied instead.</li></ul>",
-                "suggestions": "<ul><li>Check if Ollama is running and has enough memory.</li><li>Consider using a 'low_latency' tier or providing a Groq API key.</li></ul>",
-                "metrics": fallback_metrics,
-                "soap": {"s": "N/A", "o": "N/A", "a": "System Overloaded or Unavailable", "p": "Ensure LLM backend is active"},
-                "level": "Error",
-                "classification": "System Error",
-                "demographics": "Unknown"
+            if(mode === 'audio') {
+                audioBtn.classList.add(...activeClasses);
+                audioBtn.classList.remove(...inactiveClasses);
+                switchTab('record'); // Default to record for audio
+            } else if (mode === 'video') {
+                videoBtn.classList.add(...activeClasses);
+                videoBtn.classList.remove(...inactiveClasses);
+                switchTab('record'); // Default to record for video
+            } else if (mode === 'text') {
+                textBtn.classList.add(...activeClasses);
+                textBtn.classList.remove(...inactiveClasses);
+                switchTab('text'); // Switch to the new text tab
             }
 
-        # 3. TTS
-        corrected_text = ai_data.get("text", "")
-        logger.info(f"Synthesizing speech for corrected text in language '{final_lang}'...")
-        output_audio_url = await tts_router(corrected_text, final_lang, voice_pref, speed=final_speed)
-        
-        # 4. Calculate Metrics (WER / Correction Rate)
-        # We treat the "Corrected Text" as the Reference (Ground Truth) and Input as Hypothesis
-        wer_score = 0.0
-        if corrected_text and transcribed_text:
-            try:
-                wer_score = jiwer.wer(corrected_text, transcribed_text)
-            except:
-                wer_score = 0.0
-
-        # For South Indian languages and Hindi, show English translation instead of raw script in UI
-        # This improves user experience by showing readable text while preserving analysis accuracy
-        display_input_text = transcribed_text
-        display_response_input_text = transcribed_text
-
-        # Languages that should show English translation in the UI instead of raw script
-        TRANSLATION_LANGUAGES = {"ta", "kn", "ml", "hi", "te"}  # Tamil, Kannada, Malayalam, Hindi, Telugu
-
-        if detected_lang in TRANSLATION_LANGUAGES:
-            english_translation = ai_data.get("english_translation", "").strip()
-            if english_translation and english_translation != "N/A":
-                display_input_text = english_translation
-                display_response_input_text = english_translation
-                logger.info(f"📝 Showing English translation for {LANGUAGE_NAMES.get(detected_lang, detected_lang)} input")
-
-        return {
-            "input_audio_url": input_audio_url,
-            "input_text": display_input_text,  # Show translation for South Indian languages
-            "output_audio_url": output_audio_url,
-            "output_text": corrected_text,
-            "analysis": ai_data,
-            "response": {**ai_data, "audio_url": output_audio_url, "input_audio_url": input_audio_url, "input_text": display_response_input_text, "acoustic_features": acoustic_features}, # For new UI compatibility
-            "metrics": {"wer": wer_score},
-            "detected_language": detected_lang,
-            "status": "success",
-            "transcription": transcribed_text  # Keep raw transcription for analysis
-        }
-    except Exception as e:
-        logger.error("❌ Pipeline Error:")
-        traceback.print_exc()
-        # Return proper error response with analysis structure so frontend can display it
-        return {
-            "status": "error",
-            "message": str(e),
-            "input_audio_url": input_audio_url,
-            "transcription": "(Error)",
-            "response": {
-                "text": "(Error)",
-                "analysis": f"<ul><li><strong>Transcription Failed</strong>: {str(e)}</li><li>Please ensure your audio file contains clear speech and is not silent/corrupted.</li><li>Check your microphone levels and try again.</li></ul>",
-                "suggestions": "<ul><li>📍 <strong>Recording Tips:</strong></li><li>Speak clearly and loudly</li><li>Minimize background noise</li><li>Use a good quality microphone</li><li>Ensure the audio file is not corrupted</li></ul>",
-                "soap": {
-                    "s": "Audio transcription failed - unable to process input",
-                    "o": "No speech detected or audio file is corrupted",
-                    "a": "Transcription Error - technical issue with input processing",
-                    "p": "Retry with a valid audio recording containing clear speech"
-                },
-                "metrics": {"words": 0, "disfluencies": 0, "rate": 0},
-                "level": "Error",
-                "classification": "Input Error",
-                "demographics": "Unknown"
+            // Update Upload UI
+            const fileInput = document.getElementById('fileInput');
+            const uploadIcon = document.querySelector('#content-upload i');
+            const uploadText = document.querySelector('#content-upload p.text-xs');
+            
+            if (mode === 'video') {
+                fileInput.accept = "video/*";
+                uploadIcon.className = "fas fa-video text-3xl text-gray-400 mb-2";
+                uploadText.innerText = "MP4, WEBM, MOV";
+                document.getElementById('videoPreviewContainer').classList.remove('hidden');
+                document.querySelector('#recordBtn i').className = "fas fa-video";
+            } else if (mode === 'audio') {
+                fileInput.accept = "audio/*";
+                uploadIcon.className = "fas fa-cloud-upload-alt text-3xl text-gray-400 mb-2";
+                uploadText.innerText = "MP3, WAV, WEBM";
+                document.getElementById('videoPreviewContainer').classList.add('hidden');
+                document.querySelector('#recordBtn i').className = "fas fa-microphone";
+            } else if (mode === 'text') {
+                // Hide record/upload/url tabs if not relevant
+                switchTab('text');
             }
         }
 
+        // --- Tab Logic ---
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            document.getElementById('content-' + tab)?.classList.remove('hidden');
+            
+            // Reset Buttons
+            ['record', 'upload', 'url'].forEach(t => {
+                const btn = document.getElementById('tab-' + t);
+                if(btn) {
+                    btn.classList.remove('active');
+                    btn.classList.add('text-gray-500', 'dark:text-gray-400');
+                }
+            });
+            
+            // Active Button
+            const activeBtn = document.getElementById('tab-' + tab);
+            if(activeBtn) {
+                activeBtn.classList.add('active');
+                activeBtn.classList.remove('text-gray-500', 'dark:text-gray-400');
+            }
+        }
 
-def main():
-    app_host = os.getenv("HOST", "127.0.0.1")
-    app_port = int(os.getenv("PORT", 9067))
-    print(f"🚀 Starting Stutter2Fluent ({ACTIVE_TIER} tier)...")
-    print(f"ℹ️  Voice Profile: {VOICE_PROFILE}, Speed: {SPEED}x")
-    print(f"👉 Open your browser at http://{app_host}:{app_port}")
-    print(f"   (Set the 'PORT' environment variable to use a different port if {app_port} is busy)")
-    # webbrowser.open(f"http://localhost:{app_port}") # Disable auto-open for Docker/Server envs
-    uvicorn.run(app, host=app_host, port=app_port)
+        // Configuration
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let allVoices = {}; // Cache for voices
+        
 
-if __name__ == "__main__":
-    main()
+        const messageBlobs = {}; // Store blobs in memory for re-processing
+
+        let currentAgentAudio = null;
+        let isAgentSpeaking = false;
+        // --- Session Management (Memory) ---
+        const sessionId = sessionStorage.getItem('sessionId') || `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        sessionStorage.setItem('sessionId', sessionId);
+
+        function stopAllAudio() {
+            if (currentAgentAudio) {
+                currentAgentAudio.pause();
+                currentAgentAudio.currentTime = 0;
+            }
+            // Stop both audio and video playback (except the recorder preview)
+            document.querySelectorAll('audio, video').forEach(el => {
+                if (el.id !== 'videoPreview') el.pause();
+            });
+        }
+
+        // --- Voice Management ---
+        async function loadVoices() {
+            try {
+                const res = await fetch('/voices');
+                if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                allVoices = await res.json();
+                updateVoiceList(); // Initial population
+            } catch (e) {
+                console.error("Failed to load voices:", e);
+                alert("Could not load voices. Please ensure the backend is running.");
+            }
+        }
+
+        function updateVoiceList() {
+            const select = document.getElementById('voiceSelect');
+            const langSelect = document.getElementById('languageSelect');
+            if (!select) return;
+
+            const selectedLang = (langSelect && langSelect.value) ? langSelect.value : 'en';
+            const langKey = selectedLang === 'auto' ? 'en' : selectedLang;
+
+            select.innerHTML = ''; // Clear existing
+                
+            let list = (allVoices && allVoices[langKey]) ? allVoices[langKey] : (allVoices && allVoices['en']) ? allVoices['en'] : [];
+
+            if (list.length === 0) {
+                const opt = document.createElement('option');
+                opt.value = "";
+                opt.text = "No voices available";
+                select.appendChild(opt);
+                return;
+            }
+
+            list.forEach(v => {
+                const opt = document.createElement('option');
+                opt.value = v.id;
+                opt.text = v.name;
+                select.appendChild(opt);
+            });
+
+            // Restore Voice Selection
+            const savedVoice = localStorage.getItem('selectedVoice');
+            if (savedVoice && Array.from(select.options).some(opt => opt.value === savedVoice)) {
+                select.value = savedVoice;
+            }
+        }
+
+        const sampleTexts = {
+            "en": "Hello, this is a sample of my voice.",
+            "hi": "नमस्ते, यह मेरी आवाज़ का एक नमूना है.",
+            "te": "హలో, ఇది నా స్వర నమూనా.",
+            "ta": "வணக்கம், இது எனது குரல் மாதிரி.",
+            "kn": "ನಮಸ್ಕಾರ, ಇದು ನನ್ನ ಧ್ವನಿ ಮಾದರಿ.",
+            "ml": "ഹലോ, ഇത് എന്റെ ശബ്ദ ഉദാഹരണം ആണ്."
+        };
+
+        async function playVoiceSample() {
+            const voice = document.getElementById('voiceSelect').value;
+            const lang = document.getElementById('languageSelect')?.value || 'en';
+            const text = sampleTexts[lang] || sampleTexts['en'];
+            
+            if (!voice) return alert("Please select a voice first.");
+
+            const btn = document.querySelector('button[title="Play Sample"]');
+            const originalHtml = btn.innerHTML;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin text-xs"></i>';
+            btn.disabled = true;
+
+            const formData = new FormData();
+            formData.append('text', text);
+            formData.append('lang', lang);
+            formData.append('voice', voice);
+
+            try {
+                const res = await fetch('/process/regenerate', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (data.audio_url) {
+                    const audio = new Audio(data.audio_url);
+                    audio.play();
+                }
+            } catch (e) {
+                console.error("Sample play failed:", e);
+            } finally {
+                btn.innerHTML = originalHtml;
+                btn.disabled = false;
+            }
+        }
+
+        // --- UI Functions ---
+
+        function appendUserMessage(text, media = null, transcription = null, save = true, existingId = null) {
+            const chatHistory = document.getElementById('chatHistory');
+            const emptyState = document.getElementById('emptyState');
+            if(emptyState) emptyState.style.display = 'none';
+            
+            const div = document.createElement('div');
+            const messageId = existingId || `user-msg-${Date.now()}`;
+            div.id = messageId;
+            div.className = 'flex justify-end animate-slide-in-right w-full';
+            
+            let innerContent = `
+                <div class="group relative max-w-[80%]">
+                    <div class="user-bubble bg-gradient-to-r from-primary to-secondary text-white rounded-2xl rounded-tr-sm p-4 shadow-lg shadow-primary/20">
+                        <div class="text-xs opacity-70 mb-1 uppercase tracking-wide font-bold">You</div>
+                        ${text ? `<div class="text-sm">${text}</div>` : ''}
+                `;
+            
+            // Add action buttons for all inputs (text or audio)
+            innerContent += `
+                <div class="absolute top-2 -left-14 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button onclick="reprocessMessage('${messageId}')" class="p-2 rounded-full bg-gray-200/50 dark:bg-gray-700/50 hover:bg-gray-300/50 dark:hover:bg-gray-600/50 backdrop-blur-sm text-gray-500 dark:text-gray-400 text-xs" title="Re-analyze"><i class="fas fa-sync-alt"></i></button>
+                    <button onclick="deleteMessage('${messageId}')" class="p-2 rounded-full bg-gray-200/50 dark:bg-gray-700/50 hover:bg-gray-300/50 dark:hover:bg-gray-600/50 backdrop-blur-sm text-gray-500 dark:text-gray-400 text-xs" title="Delete"><i class="fas fa-trash"></i></button>
+                </div>
+            `;
+
+            if (media) {
+                messageBlobs[messageId] = media; // Store blob for re-processing
+                let url;
+                let isVideo = false;
+
+                if (typeof media === 'string') {
+                    url = media;
+                    // Simple extension check for URLs
+                    isVideo = /\.(mp4|webm|mov|mkv|avi)$/i.test(url);
+                } else {
+                    url = URL.createObjectURL(media);
+                    // Check MIME type for Blobs/Files
+                    isVideo = media.type.startsWith('video/');
+                }
+
+                if (isVideo) {
+                    innerContent += `<div class="mt-2 bg-black/20 rounded p-2"><video controls src="${url}" class="w-full max-h-64 rounded"></video></div>`;
+                } else {
+                    innerContent += `<div class="mt-2 bg-white/10 rounded p-2"><audio controls src="${url}" class="w-full h-8"></audio></div>`;
+                }
+            }
+
+            if (transcription) {
+                innerContent += `<div class="mt-2 text-xs italic opacity-80 border-t border-white/20 pt-2">"${transcription}"</div>`;
+            }
+            
+            innerContent += `</div></div>`;
+            div.innerHTML = innerContent;
+            chatHistory.appendChild(div);
+            scrollToBottom();
+            
+            if (save) {
+                saveToHistory(messageId, 'user', { text, transcription });
+            }
+            return messageId;
+        }
+
+        function updateUserMessageWithTranscription(messageId, transcription) {
+            const messageDiv = document.getElementById(messageId);
+            if (messageDiv && transcription) {
+                const bubble = messageDiv.querySelector('.user-bubble');
+                if(bubble) {
+                    const tBox = document.createElement('div');
+                    tBox.className = 'mt-2 text-xs italic opacity-80 border-t border-white/20 pt-2';
+                    tBox.innerText = `"${transcription}"`;
+                    bubble.appendChild(tBox);
+                }
+                
+                // Update history
+                let history = JSON.parse(sessionStorage.getItem('chatHistory') || '[]');
+                const item = history.find(i => i.id === messageId);
+                if (item) {
+                    item.content.transcription = transcription;
+                    sessionStorage.setItem('chatHistory', JSON.stringify(history));
+                }
+            }
+        }
+
+        function appendAgentMessage(data, save = true) {
+            const chatHistory = document.getElementById('chatHistory');
+            const div = document.createElement('div');
+            div.className = 'flex justify-start animate-fade-in w-full mb-4';
+            // Allow updating existing message if ID provided
+            if (data.id) div.id = data.id;
+            else div.id = `agent-msg-${Date.now()}`;
+
+            // Safe encoding for onclick handlers to prevent syntax errors with quotes/newlines
+            const safeTranscription = encodeURIComponent(data.transcription || "").replace(/'/g, "%27");
+            const safeFluentText = encodeURIComponent(data.response?.text || "").replace(/'/g, "%27");
+            
+            let content = `
+                <div class="group relative max-w-[90%] w-full">
+                     <div class="absolute top-2 -right-10 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button onclick="regenerateAnalysis(this, decodeURIComponent('${safeTranscription}'))" class="p-2 rounded-full bg-white/20 dark:bg-gray-900/50 hover:bg-white/40 dark:hover:bg-gray-900 backdrop-blur-sm text-gray-500 dark:text-gray-400 text-xs" title="Regenerate Analysis"><i class="fas fa-redo"></i></button>
+                        <button onclick="deleteMessage('${div.id}')" class="p-2 rounded-full bg-white/20 dark:bg-gray-900/50 hover:bg-white/40 dark:hover:bg-gray-900 backdrop-blur-sm text-gray-500 dark:text-gray-400 text-xs" title="Delete"><i class="fas fa-trash"></i></button>
+                    </div>
+                    <div class="glass-bubble rounded-2xl rounded-tl-sm p-6 shadow-xl">
+                        <div class="flex items-center gap-2 mb-3 border-b border-gray-100 dark:border-gray-700 pb-2">
+                            <div class="w-6 h-6 rounded bg-secondary flex items-center justify-center text-white text-xs"><i class="fas fa-robot"></i></div>
+                            <span class="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase">Vocal Agent Analysis</span>
+                        </div>
+            `;
+
+            // ⚠️ ERROR HANDLING: Check if response failed
+            if (data.status === "error") {
+                content += `
+                    <div class="mt-4 bg-red-50 dark:bg-red-900/20 border-l-4 border-red-500 rounded-lg p-4">
+                        <div class="flex items-start gap-3">
+                            <i class="fas fa-exclamation-circle text-red-500 text-lg mt-0.5"></i>
+                            <div class="flex-1">
+                                <h4 class="font-bold text-red-700 dark:text-red-400 mb-2">Processing Error</h4>
+                                <p class="text-red-600 dark:text-red-300 text-sm mb-3">${data.message || 'An error occurred during processing'}</p>
+                                <div class="text-sm text-red-600 dark:text-red-400 bg-white/50 dark:bg-red-900/30 rounded p-2 font-mono">
+                                    ${data.response?.analysis || 'Please check your audio file and try again.'}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                div.innerHTML = content + `</div></div>`;
+                chatHistory.appendChild(div);
+                scrollToBottom();
+                if (save) {
+                    saveToHistory(`agent-msg-${Date.now()}`, 'agent', null, data);
+                }
+                return;
+            }
+
+
+            // Chain of Thought Section (Collapsible)
+            const thoughtsText = data.response?.thoughts || data.thoughts;
+            if (thoughtsText) {
+                content += `
+                    <div class="mb-4 bg-gray-100 dark:bg-gray-900/50 rounded-lg p-3 text-xs font-mono text-gray-600 dark:text-gray-400 border-l-2 border-gray-400">
+                        <div class="font-bold mb-1 flex items-center gap-2"><i class="fas fa-brain"></i> Reasoning Process</div>
+                        <div class="whitespace-pre-wrap leading-relaxed">${thoughtsText.replace(/<thought>|<\/thought>/g, '')}</div>
+                    </div>
+            `;
+            }
+            
+            // Difficulty Level Badge
+            if (data.response.level) {
+                let badgeColor = 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200';
+                if (data.response.level === 'Beginner') badgeColor = 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200';
+                if (data.response.level === 'Intermediate') badgeColor = 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200';
+                if (data.response.level === 'Advanced') badgeColor = 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200';
+                
+                content += `<span class="inline-block px-2 py-1 rounded text-xs font-bold ${badgeColor} mb-3">${data.response.level}</span>`;
+            }
+
+            // Clinical Details (Classification & Demographics)
+            if (data.response.classification || data.response.demographics) {
+                 content += `
+                    <div class="flex flex-wrap gap-2 mb-4 text-xs">
+                        ${data.response.classification ? `<span class="px-2 py-1 rounded bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200 font-semibold">Type: ${data.response.classification}</span>` : ''}
+                        ${data.response.demographics ? `<span class="px-2 py-1 rounded bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300">Subject: ${data.response.demographics}</span>` : ''}
+                    </div>
+                 `;
+            }
+
+            // Raw Transcription (Added)
+            content += `
+                <div class="mb-4 bg-gray-50 dark:bg-gray-800/50 rounded-lg p-3 border border-gray-100 dark:border-gray-700">
+                    <h3 class="text-xs font-semibold text-gray-400 mb-1 uppercase">Raw Input (What you said)</h3>
+                    <p class="text-md text-gray-600 dark:text-gray-300 italic">"${data.transcription}"</p>
+                </div>
+            `;
+
+            // Corrected Text
+            content += `
+                <div class="mb-4">
+                    <h3 class="text-sm font-semibold text-gray-400 mb-1">Fluent Speech</h3>
+                    <p id="fluent-text-${Date.now()}" class="text-lg font-medium text-gray-800 dark:text-gray-100 leading-relaxed">${data.response.text}</p>
+                    ${data.response.english_translation ? `<div class="mt-2 pt-2 border-t border-gray-200 dark:border-gray-700"><h4 class="text-xs font-semibold text-gray-400 mb-1 uppercase">English Translation</h4><p class="text-md text-gray-600 dark:text-gray-300 italic">${data.response.english_translation}</p></div>` : ''}
+                </div>
+            `;
+            
+            if (data.response.audio_url) {
+                // Audio Output
+                // Add ID to control playback for barge-in
+                const audioId = `agent-audio-${Date.now()}`;
+                content += `
+                    <div class="bg-gray-50 dark:bg-gray-800 rounded-lg p-3 mb-4 flex items-center gap-3">
+                        <div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-white"><i class="fas fa-volume-up"></i></div>
+                        <audio id="${audioId}" controls src="${data.response.audio_url}" class="w-full h-8"></audio>
+                        <button onclick="regenerateAudio(this, decodeURIComponent('${safeFluentText}'), '${data.detected_language}', '${audioId}')" class="p-2 text-gray-400 hover:text-primary transition-colors" title="Regenerate Voice" aria-label="Regenerate Voice">
+                            <i class="fas fa-sync-alt"></i>
+                        </button>
+                        <a href="${data.response.audio_url}" download="fluent_speech.wav" class="p-2 text-gray-400 hover:text-green-500 transition-colors" title="Download Audio" aria-label="Download Audio">
+                            <i class="fas fa-download"></i>
+                        </a>
+                    </div>
+                `;
+            }
+
+            // Acoustic Features Dashboard
+            if (data.response.acoustic_features) {
+                content += `
+                    <div class="grid grid-cols-3 gap-2 mb-4">
+                        <div class="bg-indigo-50 dark:bg-indigo-900/20 p-2 rounded text-center border border-indigo-100 dark:border-indigo-800">
+                            <div class="text-[10px] uppercase tracking-wider text-gray-400">Loudness (RMS)</div>
+                            <div class="font-bold text-indigo-600 dark:text-indigo-300">${Number(data.response.acoustic_features.rms).toFixed(3)}</div>
+                        </div>
+                        <div class="bg-indigo-50 dark:bg-indigo-900/20 p-2 rounded text-center border border-indigo-100 dark:border-indigo-800">
+                            <div class="text-[10px] uppercase tracking-wider text-gray-400">Noisiness (ZCR)</div>
+                            <div class="font-bold text-indigo-600 dark:text-indigo-300">${Number(data.response.acoustic_features.zcr).toFixed(3)}</div>
+                        </div>
+                        <div class="bg-indigo-50 dark:bg-indigo-900/20 p-2 rounded text-center border border-indigo-100 dark:border-indigo-800">
+                            <div class="text-[10px] uppercase tracking-wider text-gray-400">Variance</div>
+                            <div class="font-bold text-indigo-600 dark:text-indigo-300">${Number(data.response.acoustic_features.variance).toFixed(3)}</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Metrics Dashboard
+            if (data.response.metrics) {
+                content += `
+                    <div class="grid grid-cols-3 gap-2 mb-4">
+                        <div class="bg-gray-50 dark:bg-gray-800 p-2 rounded text-center">
+                            <div class="text-xs text-gray-400">Words</div>
+                            <div class="font-bold text-gray-700 dark:text-gray-200">${data.response.metrics.words}</div>
+                        </div>
+                        <div class="bg-gray-50 dark:bg-gray-800 p-2 rounded text-center">
+                            <div class="text-xs text-gray-400">Disfluencies</div>
+                            <div class="font-bold text-red-500">${data.response.metrics.disfluencies}</div>
+                        </div>
+                        <div class="bg-gray-50 dark:bg-gray-800 p-2 rounded text-center">
+                            <div class="text-xs text-gray-400">Fluency</div>
+                            <div class="font-bold text-green-500">${data.response.metrics.rate}%</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Analysis Content
+            // High-Resolution Grid Layout for Clinical Depth
+            content += `
+                <div class="mt-6 space-y-6">
+                    <!-- Full Width Analysis -->
+                    <div class="glass-panel p-6 border-l-4 border-primary rounded-xl">
+                        <h3 class="text-lg font-bold mb-4 flex items-center gap-2 text-primary">
+                            <i class="fas fa-stethoscope"></i> Clinical SLP Analysis
+                        </h3>
+                        <div class="analysis-content text-gray-700 dark:text-gray-300 text-sm leading-relaxed">
+                            ${data.response.analysis || 'No analysis available.'}
+                        </div>
+                        ${(data.response.soap && (data.response.soap.a === 'JSON Error' || data.response.soap.a === 'Processing Error')) ? 
+                            `<div class="mt-3">
+                                <button onclick="regenerateAnalysis(this, decodeURIComponent('${safeTranscription}'))" class="bg-red-500/80 hover:bg-red-600 text-white px-3 py-1.5 rounded text-xs font-semibold transition-colors flex items-center gap-2">
+                                    <i class="fas fa-redo"></i> Retry Analysis
+                                </button>
+                            </div>` 
+                            : ''
+                        }
+                    </div>
+                    
+                    <!-- Side-by-Side SOAP and Suggestions -->
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <!-- SOAP Notes -->
+                        <div class="glass-panel p-6 border-l-4 border-secondary rounded-xl h-full">
+                            <h3 class="text-lg font-bold mb-4 flex items-center gap-2 text-secondary">
+                                <i class="fas fa-file-medical"></i> Clinical Documentation (SOAP)
+                            </h3>
+                            ${data.response.soap ? `
+                            <div class="space-y-3 text-sm">
+                                <div class="bg-white/5 p-3 rounded-lg border border-white/10"><b class="text-secondary block mb-1 text-xs uppercase opacity-80">Subjective</b> <span class="text-gray-700 dark:text-gray-300">${data.response.soap.s || '-'}</span></div>
+                                <div class="bg-white/5 p-3 rounded-lg border border-white/10"><b class="text-secondary block mb-1 text-xs uppercase opacity-80">Objective</b> <span class="text-gray-700 dark:text-gray-300">${data.response.soap.o || '-'}</span></div>
+                                <div class="bg-white/5 p-3 rounded-lg border border-white/10"><b class="text-secondary block mb-1 text-xs uppercase opacity-80">Assessment</b> <span class="text-gray-700 dark:text-gray-300">${data.response.soap.a || '-'}</span></div>
+                                <div class="bg-white/5 p-3 rounded-lg border border-white/10"><b class="text-secondary block mb-1 text-xs uppercase opacity-80">Plan</b> <span class="text-gray-700 dark:text-gray-300">${data.response.soap.p || '-'}</span></div>
+                            </div>
+                            ` : '<p class="text-gray-500">No SOAP notes available.</p>'}
+                        </div>
+
+                        <!-- Suggestions -->
+                        <div class="glass-panel p-6 border-l-4 border-yellow-500 rounded-xl h-full">
+                            <h3 class="text-lg font-bold mb-4 flex items-center gap-2 text-yellow-500">
+                                <i class="fas fa-lightbulb"></i> Therapeutic Suggestions
+                            </h3>
+                             <div class="analysis-content text-gray-700 dark:text-gray-300 text-sm">
+                                ${data.response.suggestions || 'No suggestions available.'}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            content += `</div></div>`;
+            div.innerHTML = content;
+            chatHistory.appendChild(div);
+            scrollToBottom();
+
+            // Attach Event Listeners for VAD (Barge-in)
+            if (data.response?.audio_url) {
+                const audioEl = div.querySelector('audio');
+                if (audioEl) {
+                    audioEl.onplay = () => { isAgentSpeaking = true; currentAgentAudio = audioEl; };
+                    audioEl.onended = () => { isAgentSpeaking = false; currentAgentAudio = null; };
+                    audioEl.onpause = () => { isAgentSpeaking = false; };
+                }
+            }
+            
+            if (save) {
+                saveToHistory(`agent-msg-${Date.now()}`, 'agent', null, data);
+            }
+        }
+
+        function appendLoading() {
+            const chatHistory = document.getElementById('chatHistory');
+            const div = document.createElement('div');
+            div.id = 'loadingMessage';
+            div.className = 'flex justify-start animate-fade-in mb-4';
+            div.innerHTML = `
+                <div class="glass-bubble rounded-2xl rounded-tl-sm p-4 shadow-sm flex items-center gap-3">
+                    <div class="w-2 h-2 bg-primary rounded-full animate-bounce"></div>
+                    <div class="w-2 h-2 bg-primary rounded-full animate-bounce" style="animation-delay: 0.1s"></div>
+                    <div class="w-2 h-2 bg-primary rounded-full animate-bounce" style="animation-delay: 0.2s"></div>
+                    <span class="text-sm text-gray-500 ml-2">Analyzing speech patterns...</span>
+                </div>`;
+            chatHistory.appendChild(div);
+            scrollToBottom();
+        }
+
+        function removeLoading() {
+            const loading = document.getElementById('loadingMessage');
+            if(loading) loading.remove();
+        }
+
+        function scrollToBottom() {
+            const chatHistory = document.getElementById('chatHistory');
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+
+        function handleFileSelect(input) {
+            const fileInfo = document.getElementById('fileInfo');
+            if(input.files[0]) {
+                fileInfo.innerText = `Selected: ${input.files[0].name}`;
+                fileInfo.classList.remove('hidden');
+            }
+        }
+
+        // --- History Management ---
+        function saveToHistory(id, role, content, data = null) {
+            try {
+                let history = JSON.parse(sessionStorage.getItem('chatHistory') || '[]');
+                // Check if exists to update or push new
+                const index = history.findIndex(item => item.id === id);
+                if (index !== -1) {
+                    history[index] = { id, role, content, data, timestamp: history[index].timestamp };
+                } else {
+                    history.push({ id, role, content, data, timestamp: Date.now() });
+                }
+                sessionStorage.setItem('chatHistory', JSON.stringify(history));
+            } catch (e) {
+                console.error("Failed to save history:", e);
+            }
+        }
+
+        function loadHistory() {
+            try {
+                let history = JSON.parse(sessionStorage.getItem('chatHistory') || '[]');
+                if (history.length > 0) {
+                    const emptyState = document.getElementById('emptyState');
+                    if(emptyState) emptyState.style.display = 'none';
+                    
+                    history.forEach(item => {
+                        if (item.role === 'user') {
+                            // Note: Audio blobs cannot be restored from sessionStorage easily, so we pass null
+                            appendUserMessage(item.content.text, item.content.mediaUrl || null, item.content.transcription, false, item.id); 
+                        } else if (item.role === 'agent') {
+                            appendAgentMessage(item.data, false);
+                        }
+                    });
+                    scrollToBottom();
+                }
+            } catch (e) {
+                console.error("Failed to load chat history:", e);
+                sessionStorage.removeItem('chatHistory'); // Clear corrupted history
+            }
+        }
+        
+        function resetSettings() {
+            if(confirm("Reset all settings and clear history?")) {
+                localStorage.clear();
+                sessionStorage.clear();
+                location.reload();
+            }
+        }
+
+        function clearChat() {
+            if(confirm("Are you sure you want to clear the chat history?")) {
+                sessionStorage.removeItem('chatHistory');
+                location.reload();
+            }
+        }
+
+        function startNewSession() {
+            if (confirm("This will start a new analysis session, clearing the current chat history from this browser. Continue?")) {
+                sessionStorage.removeItem('sessionId');
+                sessionStorage.removeItem('chatHistory');
+                location.reload();
+            }
+        }
+
+        function deleteMessage(messageId) {
+            const messageEl = document.getElementById(messageId);
+            if (messageEl && confirm("Are you sure you want to delete this message?")) {
+                messageEl.remove();
+                delete messageBlobs[messageId]; // Cleanup memory
+                // Also remove from sessionStorage
+                let history = JSON.parse(sessionStorage.getItem('chatHistory') || '[]');
+                history = history.filter(item => item.id !== messageId);
+                sessionStorage.setItem('chatHistory', JSON.stringify(history));
+            }
+        }
+
+        async function reprocessMessage(messageId) {
+            const media = messageBlobs[messageId];
+            if (!media) {
+                alert("Cannot re-process this message (audio data not available from previous session).");
+                return;
+            }
+            
+            const messageDiv = document.getElementById(messageId);
+            const btn = messageDiv.querySelector('button[title="Re-analyze"]');
+            const originalHtml = btn.innerHTML;
+            
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            
+            try {
+                if (typeof media === 'string') {
+                    // It is a URL (from previous URL input)
+                    await processUrl(null, media);
+                } else {
+                    // It is a Blob/File
+                    // Pass null for btn so processAudio doesn't override our custom spinner logic
+                    await processAudio(media, null, null); 
+                }
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
+        }
+
+        // --- Logic ---
+
+        async function regenerateAudio(btn, text, lang, audioId) {
+            const icon = btn.querySelector('i');
+            const originalClass = icon.className;
+            icon.className = 'fas fa-spinner fa-spin';
+            
+            const formData = new FormData();
+            formData.append('text', text);
+            formData.append('lang', lang);
+            formData.append('voice', document.getElementById('voiceSelect').value);
+
+            try {
+                const res = await fetch('/process/regenerate', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (data.audio_url) {
+                    const audio = document.getElementById(audioId);
+                    audio.src = data.audio_url;
+                    audio.play();
+                }
+            } catch (e) {
+                console.error("Failed to regenerate audio:", e);
+                alert("Connection Error: " + e.message + "\n\nPlease ensure the backend server is running.");
+            } finally {
+                icon.className = originalClass;
+            }
+        }
+
+        async function regenerateAnalysis(btn, originalTranscription) {
+            const icon = btn.querySelector('i');
+            const originalClass = icon.className;
+            icon.className = 'fas fa-spinner fa-spin';
+            btn.disabled = true;
+
+            // Find the parent message card to replace it
+            const agentCard = btn.closest('.flex.justify-start');
+
+            appendLoading(); // Show a global loading indicator
+
+            const formData = new FormData();
+            // We create a dummy blob because the endpoint expects a file.
+            // The key part is sending the original transcription.
+            const dummyBlob = new Blob([originalTranscription], { type: 'text/plain' });
+            formData.append('file', dummyBlob, 'regeneration.txt'); // The file content is the transcription
+            formData.append('voice', document.getElementById('voiceSelect').value);
+            formData.append('tone', document.getElementById('toneSelect').value);
+            formData.append('speed', document.getElementById('speedSelect').value);
+            formData.append('analysis_mode', document.getElementById('analysisModeSelect').value);
+            const selectedLang = document.getElementById('languageSelect')?.value || 'en';
+            formData.append('language', selectedLang);
+            formData.append('session_id', sessionId);
+
+            try {
+                // Call the main processing endpoint again with the original text
+                const res = await fetch('/api/process', { method: 'POST', body: formData });
+                const data = await res.json();
+                removeLoading();
+                if (data.status === 'success') {
+                    // Replace the old card with the new one
+                    agentCard.remove();
+                    appendAgentMessage(data);
+                } else {
+                    alert("Failed to regenerate analysis: " + data.message);
+                }
+            } catch (e) {
+                removeLoading();
+                alert("Connection error during regeneration: " + e.message);
+            } finally {
+                icon.className = originalClass;
+                btn.disabled = false;
+            }
+        }
+
+        async function processUpload(btn) {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            if (!file) {
+                alert("Please select a file first.");
+                return;
+            }
+            const userMessageId = appendUserMessage(`Uploaded: ${file.name}`, file);
+            await processAudio(file, userMessageId, btn);
+        }
+
+        async function processUrl(btn, urlStr = null) {
+            const urlInput = document.getElementById('urlInput');
+            const url = urlStr || urlInput.value.trim();
+            if (!url) {
+                alert("Please enter a URL.");
+                return;
+            }
+
+            const userMessageId = appendUserMessage(`URL: ${url}`, url);
+            
+            appendLoading();
+            let originalText = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+
+            const selectedLang = document.getElementById('languageSelect')?.value || 'en';
+            const formData = new FormData();
+            formData.append('url', url);
+            formData.append('voice', document.getElementById('voiceSelect').value);
+            formData.append('tone', document.getElementById('toneSelect').value);
+            formData.append('speed', document.getElementById('speedSelect').value);
+            formData.append('analysis_mode', document.getElementById('analysisModeSelect').value);
+            formData.append('language', selectedLang);
+            formData.append('session_id', sessionId);
+
+            try {
+                const res = await fetch('/process/url', { method: 'POST', body: formData });
+                if (!res.ok) {
+                    const errText = await res.text();
+                    throw new Error(`Server Error (${res.status}): ${errText.substring(0, 100)}...`);
+                }
+                const data = await res.json();
+                removeLoading();
+                if (data.status === 'success') {
+                    if (userMessageId) updateUserMessageWithTranscription(userMessageId, data.transcription);
+                    appendAgentMessage(data);
+                } else {
+                    alert("Processing Error: " + (data.message || "Unknown error occurred."));
+                }
+            } catch (e) {
+                removeLoading();
+                console.error("URL Processing Error:", e);
+                alert("Connection Error: " + e.message + "\n\nPlease ensure the backend server is running and the URL is accessible.");
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                }
+            }
+        }
+
+        async function processText(btn) {
+            const textInput = document.getElementById('textInput');
+            const text = textInput.value.trim();
+            if (!text) {
+                alert("Please enter some text to analyze.");
+                return;
+            }
+            const textBlob = new Blob([text], { type: 'text/plain' });
+            const userMessageId = appendUserMessage(`Text Input: "${text.substring(0, 50)}..."`, null, text);
+            await processAudio(textBlob, userMessageId, btn);
+        }
+
+        async function processAudio(blob, userMessageId, btn) {
+            appendLoading();
+            let originalText = '';
+            if(btn) {
+                originalText = btn.innerHTML;
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+            }
+            
+            const selectedLang = document.getElementById('languageSelect')?.value || 'en';
+            const formData = new FormData();
+            
+            let ext = 'webm';
+            if (blob.type) {
+                if (blob.type.includes('mp4')) ext = 'mp4';
+                else if (blob.type.includes('mp3')) ext = 'mp3';
+                else if (blob.type.includes('ogg')) ext = 'ogg';
+                else if (blob.type.includes('wav')) ext = 'wav';
+            }
+            const filename = blob.name || `recording.${ext}`;
+            formData.append('file', blob, filename);
+            formData.append('voice', document.getElementById('voiceSelect').value);
+            formData.append('tone', document.getElementById('toneSelect').value);
+            formData.append('speed', document.getElementById('speedSelect').value);
+            formData.append('analysis_mode', document.getElementById('analysisModeSelect').value);
+            formData.append('language', selectedLang);
+            formData.append('session_id', sessionId);
+
+            try {
+                const res = await fetch('/api/process', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!res.ok) {
+                    const errText = await res.text();
+                    throw new Error(`Server Error (${res.status}): ${errText.substring(0, 100)}...`);
+                }
+
+                const data = await res.json();
+                removeLoading();
+                
+                if (data.status === 'success') {
+                    if (userMessageId) updateUserMessageWithTranscription(userMessageId, data.transcription);
+                    appendAgentMessage(data);
+                } else {
+                    alert("Processing Error: " + (data.message || "Unknown error occurred."));
+                }
+            } catch (e) {
+                removeLoading();
+                console.error("Audio Processing Error:", e);
+                alert("Connection Error: " + e.message + "\n\nPlease ensure the backend server is running.");
+            } finally {
+                if(btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                }
+            }
+        }
+
+        let mediaStream;
+        let audioContext;
+        let analyser;
+        let dataArray;
+        let canvasContext;
+        let visualizerAnimationId;
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Restore Language
+            const savedLang = localStorage.getItem('selectedLanguage');
+            if (savedLang) {
+                const langSelect = document.getElementById('languageSelect');
+                if (langSelect) langSelect.value = savedLang;
+            }
+
+            // Restore Speed
+            const savedSpeed = localStorage.getItem('selectedSpeed');
+            if (savedSpeed) {
+                const speedSelect = document.getElementById('speedSelect');
+                if (speedSelect) speedSelect.value = savedSpeed;
+            }
+            
+            const savedMode = localStorage.getItem('analysisMode');
+            if (savedMode) {
+                document.getElementById('analysisModeSelect').value = savedMode;
+            }
+
+            loadVoices();
+            loadHistory();
+
+            // Add Persistence Listeners
+            document.getElementById('voiceSelect')?.addEventListener('change', (e) => localStorage.setItem('selectedVoice', e.target.value));
+            document.getElementById('languageSelect')?.addEventListener('change', (e) => {
+                localStorage.setItem('selectedLanguage', e.target.value);
+                updateVoiceList();
+            });
+            document.getElementById('speedSelect')?.addEventListener('change', (e) => localStorage.setItem('selectedSpeed', e.target.value));
+            document.getElementById('analysisModeSelect')?.addEventListener('change', (e) => localStorage.setItem('analysisMode', e.target.value));
+            
+            const recordBtn = document.getElementById('recordBtn');
+            const statusText = document.getElementById('statusText');
+
+            if (recordBtn) {
+                recordBtn.addEventListener('click', async () => {
+            if (!isRecording) {
+
+                // Start Recording
+                const originalBtnContent = recordBtn.innerHTML;
+                recordBtn.disabled = true;
+                recordBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+                statusText.innerText = "Requesting microphone access...";
+
+                stopAllAudio(); // Stop AI if user starts speaking (Barge-in)
+
+                try {
+                    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                        throw new Error("Microphone access not supported in this browser.");
+                    }
+                    
+                    // Configure constraints based on mode
+                    const constraints = currentMode === 'video' ? 
+                        { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: true } : 
+                        { audio: { 
+                            echoCancellation: true, 
+                            noiseSuppression: true, 
+                            autoGainControl: true 
+                        }};
+                    
+                    // Reset stream if mode changed or stream inactive
+                    if (mediaStream) {
+                        const hasVideo = mediaStream.getVideoTracks().length > 0;
+                        if ((currentMode === 'video' && !hasVideo) || (currentMode === 'audio' && hasVideo)) {
+                            mediaStream.getTracks().forEach(t => t.stop());
+                            mediaStream = null;
+                        }
+                    }
+
+                    if (!mediaStream || !mediaStream.active) {
+                        mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+                    }
+                    
+                    // Setup Preview for Video
+                    if (currentMode === 'video') {
+                        const videoEl = document.getElementById('videoPreview');
+                        videoEl.srcObject = mediaStream;
+                        videoEl.play();
+                    }
+
+                    // Setup Visualizer
+                    if (currentMode === 'audio') {
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        if (audioContext.state === 'suspended') {
+                            await audioContext.resume();
+                        }
+                        const source = audioContext.createMediaStreamSource(mediaStream);
+                        analyser = audioContext.createAnalyser();
+                        analyser.fftSize = 64;
+                        source.connect(analyser);
+                        dataArray = new Uint8Array(analyser.frequencyBinCount);
+                        
+                        const canvas = document.getElementById('visualizer');
+                        canvasContext = canvas.getContext('2d');
+                        
+                        function drawVisualizer() {
+                            if (!isRecording) return;
+                            visualizerAnimationId = requestAnimationFrame(drawVisualizer);
+                            analyser.getByteFrequencyData(dataArray);
+                            canvasContext.clearRect(0, 0, canvas.width, canvas.height);
+                            const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+                            const scale = 1 + (average / 256) * 0.5;
+                            recordBtn.style.transform = `scale(${scale})`;
+                        }
+                        drawVisualizer();
+                    }
+
+                    // Optimize for clarity: Use higher bitrate and efficient codec to prevent muffled audio
+                    const mimeType = currentMode === 'video' ? 'video/webm;codecs=vp8,opus' : 'audio/webm;codecs=opus';
+                    const options = { mimeType: mimeType, audioBitsPerSecond: 256000 };
+                    if (currentMode === 'video') {
+                        options.videoBitsPerSecond = 2500000;
+                    }
+                    
+                    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                        delete options.mimeType; // Fallback to default
+                    }
+                    mediaRecorder = new MediaRecorder(mediaStream, options);
+                    audioChunks = [];
+
+                    mediaRecorder.ondataavailable = (event) => {
+                        if (event.data && event.data.size > 0) {
+                            audioChunks.push(event.data);
+                        }
+                    };
+
+                    mediaRecorder.onstop = async () => {
+                        // Stop the camera/microphone stream immediately after recording stops
+                        if (mediaStream) {
+                            mediaStream.getTracks().forEach(track => track.stop());
+                            mediaStream = null;
+                        }
+                        if (audioContext) {
+                            if (audioContext.state !== 'closed') {
+                                await audioContext.close().catch(e => console.warn(e));
+                            }
+                            audioContext = null;
+                            cancelAnimationFrame(visualizerAnimationId);
+                        }
+
+                        const blobType = mediaRecorder.mimeType || (currentMode === 'video' ? 'video/webm' : 'audio/webm');
+                        const audioBlob = new Blob(audioChunks, { type: blobType });
+                        const recordBtn = document.getElementById('recordBtn');
+                        const statusText = document.getElementById('statusText');
+
+                        try {
+                            if (audioBlob.size === 0) {
+                                throw new Error("Recording failed (Empty audio)");
+                            }
+
+                            const label = currentMode === 'video' ? "Video Recording" : "Audio Recording";
+                            const userMessageId = appendUserMessage(label, audioBlob);
+                            await processAudio(audioBlob, userMessageId);
+                            
+                        } catch (error) {
+                            console.error(error);
+                            statusText.innerText = error.message;
+                        } finally {
+                            // ALWAYS re-enable the button and reset the state, regardless of success or failure
+                            isRecording = false;
+                            recordBtn.disabled = false;
+                            recordBtn.innerHTML = currentMode === 'video' ? '<i class="fas fa-video"></i>' : '<i class="fas fa-microphone"></i>';
+                            recordBtn.classList.replace('from-red-500', 'from-primary');
+                            recordBtn.style.transform = 'scale(1)'; // Reset scale
+                            statusText.innerText = "Tap to start recording";
+                        }
+                    };
+
+                    // Countdown for Video
+                    if (currentMode === 'video') {
+                        const overlay = document.getElementById('countdownOverlay');
+                        const countText = document.getElementById('countdownText');
+                        overlay.classList.remove('hidden');
+                        
+                        for (let i = 3; i > 0; i--) {
+                            countText.innerText = i;
+                            statusText.innerText = `Starting in ${i}...`;
+                            await new Promise(r => setTimeout(r, 1000));
+                        }
+                        overlay.classList.add('hidden');
+                    }
+
+                    mediaRecorder.start(1000);
+                    isRecording = true;
+                    recordBtn.innerHTML = '<i class="fas fa-stop"></i>';
+                    recordBtn.classList.replace('from-primary', 'from-red-500');
+                    document.getElementById('recordContainer').classList.add('recording');
+                    statusText.innerText = "Recording... Tap to stop";
+                    recordBtn.disabled = false;
+                } catch (err) {
+                    console.error("Error accessing microphone:", err);
+                    alert("Could not access microphone. " + err.message + "\n\nPlease check your browser permissions.");
+                    recordBtn.innerHTML = originalBtnContent;
+                    recordBtn.disabled = false;
+                    statusText.innerText = "Microphone access denied";
+                }
+            } else {
+
+                // Stop Recording
+                if (mediaRecorder && mediaRecorder.state === 'recording') {
+                    // Disable button immediately and show processing state.
+                    // The 'onstop' handler will re-enable it and reset the UI.
+                    recordBtn.disabled = true;
+                    statusText.innerText = "Processing...";
+                    document.getElementById('recordContainer').classList.remove('recording');
+                    mediaRecorder.stop();
+                }
+            }
+        });
+            }
+        });
+    </script> 
+</body>
+</html>
