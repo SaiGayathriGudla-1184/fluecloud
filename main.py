@@ -87,13 +87,34 @@ load_dotenv()
 # --- Cloud API Configuration (The "Perfect" Stack) ---
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+
+IN_DOCKER = os.path.exists('/.dockerenv')
 
 # Optional override: Force using the cloud model (Groq) even when a local Ollama instance is configured.
 FORCE_GROQ = str(os.getenv("FORCE_GROQ", "")).strip().lower() in {"1", "true", "yes", "y"}
 
 # Optional override: Force Groq as the only LLM path (useful for South Indian languages when local Ollama quality is low).
-GROQ_ONLY = str(os.getenv("GROQ_ONLY", "")).strip().lower() in {"1", "true", "yes", "y"}
+GROQ_ONLY = str(os.getenv("GROQ_ONLY", "")).strip().lower() in {"1", "true", "yes", "y"} or IN_DOCKER
+
+if IN_DOCKER:
+    logger.info("🐳 Docker environment detected. Enforcing GROQ_ONLY to resolve LLM memory overhead.")
+
+# Memory Optimization: Run entirely on Cloud APIs to fit in <512MB RAM (Render/Railway)
+CLOUD_ONLY = str(os.getenv("CLOUD_ONLY", "")).strip().lower() in {"1", "true", "yes", "y"}
+
+# --- Timeout Configuration (Configurable via Environment Variables) ---
+# Groq cloud API timeout (increased from 10s to 30s for reliability)
+GROQ_TIMEOUT = int(os.getenv("GROQ_TIMEOUT", "30"))
+# Local Ollama timeouts per tier
+OLLAMA_TIMEOUTS = {
+    "low_latency": int(os.getenv("OLLAMA_TIMEOUT_LOW_LATENCY", "25")),
+    "balanced": int(os.getenv("OLLAMA_TIMEOUT_BALANCED", "60")),
+    "high_quality": int(os.getenv("OLLAMA_TIMEOUT_HIGH_QUALITY", "120"))
+}
+# Fallback cloud timeout multiplier (2x the local timeout, minimum 60s for reliability)
+CLOUD_FALLBACK_TIMEOUT_MULTIPLIER = float(os.getenv("CLOUD_FALLBACK_TIMEOUT_MULTIPLIER", "1.5"))
+CLOUD_FALLBACK_MIN_TIMEOUT = int(os.getenv("CLOUD_FALLBACK_MIN_TIMEOUT", "60"))
 
 # Configuration Constants
 SAMPLE_RATE = 16000          # Audio sample rate (Hz)
@@ -234,9 +255,6 @@ def determine_agent_goal(state: AgentInternalState) -> GoalBasedStrategy:
     if not state.history:
         candidate_goal = "Assessment & Rapport"
         candidate_instruction = "Establish a supportive baseline. Analyze speech patterns carefully without being overly corrective."
-    if avg_fluency < 50:
-        candidate_goal = "Crisis Pacing"
-        candidate_instruction = "PANIC MODE: User in severe loop. NO feedback. ONLY calming slow vocalization + breathing reset."
     elif avg_fluency < 40 or "anxious" in state.emotional_state.lower():
         candidate_goal = "Anxiety Reduction"
         candidate_instruction = "Prioritize emotional support. Use gentle, encouraging language. Suggest breathing or pausing techniques. Do NOT focus on minor errors."
@@ -309,7 +327,7 @@ class SoapNotes(BaseModel):
 class SpeechAnalysis(BaseModel):
     thoughts: Optional[str] = Field(None, description="Step-by-step reasoning process regarding the speech patterns.")
     text: str = Field(..., description="The corrected, fluent version of the speech.")
-    english_translation: str = Field("", description="Deprecated. Always return an empty string.")
+    english_translation: str = Field("", description="English translation of the input text. Required for Tamil, Kannada, Malayalam, Hindi, and Telugu. Empty for English.")
     metrics: Metrics
     analysis: str = Field(..., description="HTML formatted analysis.")
     suggestions: str = Field(..., description="HTML formatted suggestions.")
@@ -341,9 +359,17 @@ language_specific_insights:
   - language: "English"
     triggers: "Plosives (p, b, t, d, k, g), fricatives (s, f), and sentence-initial vowels."
   - language: "Telugu"
-    achulu: "Vowels (అ ఆ ఇ ఈ...)"
-    hallulu: "Consonants"
-    triggers: "Nasal+vowel (e.g., 'నేను' - nasal 'n' + vowel bypasses block). Repetitions on nasal starters before Achulu."
+    triggers: "Retroflex consonants (ఠ, డ, ణ), complex consonant clusters, and initial vowels. Pay special attention to word boundaries when reconstructing from fragments."
+    note: "Telugu has agglutinative morphology. Loss of suffixes can change meaning. Preserve case markers and verb tense indicators."
+  - language: "Tamil"
+    triggers: "Geminated consonants (doubled sounds), retroflex stops, and code-switching with English. Tamil has ergative alignment which affects particle placement."
+    note: "Preserve Tamil particles (um, -ai, -ey). Respect dialectal variations between formal literary and colloquial speech."
+  - language: "Kannada"
+    triggers: "Uvular sounds (retroflex r, ණ), gemination, and complex verb conjugations. Kannada lacks gender in most contexts."
+    note: "Protect case-marking suffixes and tense markers. Handle geminated consonants carefully as they change word meaning."
+  - language: "Malayalam"
+    triggers: "Chillu letters (ൾ, ൻ, ൺ, ർ, ൽ) combining with short vs long consonants. Presence of schwa insertion patterns common in spontaneous speech."
+    note: "Malayalam script combines consonant+vowel units (aksharas). Protect vowel diacritics (maatras). Casual speech often drops case endings."
 
 boli_dataset_insights:
   - common_triggers: "Stop consonants (/p/, /t/, /k/), complex clusters (/str/, /br/, /pl/), and fricatives (/f/, /sh/, /th/)."
@@ -382,11 +408,20 @@ logger.info(f"🔌 Connecting to Ollama at: {ollama_host}")
 knowledge_agent_ai = Agent(
     model=Ollama(id="llama3.1:8b", host=ollama_host, options={"temperature": 0.0, "num_ctx": 8192}),
     instructions=dedent(f"""
-        You are an expert Speech Language Pathologist AI assistant specialized in speech therapy, capable of analyzing speech patterns across multiple languages.
+        You are an expert Speech Language Pathologist AI assistant specialized in speech therapy, capable of analyzing speech patterns in multiple languages including English and South Indian languages (Telugu, Tamil, Kannada, Malayalam).
         
         CORE DIRECTIVE: You must output ONLY a valid JSON object.
-        CRITICAL: Do NOT hallucinate. In your analysis, ONLY cite words that appear in the user's input. Do not use words from other languages or examples.
-        ZERO-TOLERANCE FOR CONTENT LOSS: You must strictly preserve the entire meaning, context, and vocabulary of the user's speech. Do NOT summarize, paraphrase, or drop any valid words. ONLY remove stuttering artifacts (repetitions, prolongations, blocks, and fillers).
+        CRITICAL RULES FOR SOUTH INDIAN LANGUAGES:
+        1. PRESERVE EVERY CHARACTER AND DIACRITICAL MARK - These are essential for meaning in Telugu, Tamil, Kannada, and Malayalam.
+        2. RESTORE MISSING MORPHEMES - South Indian languages are agglutinative. Restore dropped case markers, verb endings, and suffixes based on grammatical context.
+        3. HANDLE SPECIAL CHARACTERS - Telugu: ఠ్, ఢ్, ఱ (retroflex marks), Tamil: ழ, Tamil particles, Kannada: geminated consonants (ಕ್ಕ), Malayalam: chillu letters (ൾ,ൻ).
+        4. DETECT MISSING WORDS - Stuttering in South Indian languages may result in dropped syllables or morphemes. Use linguistic knowledge to restore them.
+        5. CONTEXT RECONSTRUCTION - For Telugu: reconstruct ఎ-ఎ-ఎక్కడ -> ఎక్కడ. For Tamil: పो-పో-పోరెన్ -> పోరెన్. For Kannada: ಬ-ಬ-ಬರ -> ಬರ.
+        
+        CRITICAL RULE FOR ALL LANGUAGES:
+        6. MEANING & SPELLING - Fix all spelling mistakes caused by stuttering (e.g., "गगई" -> "गई"). Remove grammatically confused words inserted due to stuttering panic. The final text MUST be a coherent, meaningful, and naturally spelled sentence.
+        
+        CRITICAL: Do NOT hallucinate facts. In your analysis, ONLY cite words that appear in the user's input. Do not use words from other languages or examples.
 
         CHAIN OF THOUGHT REASONING:
         You utilize Chain-of-Thought reasoning to analyze speech patterns deeply before generating a response.
@@ -434,31 +469,39 @@ knowledge_agent_ai = Agent(
             "demographics": "Child"
           }}
 
+        - Input (Telugu): "నేను... నేను... వెళ్ళాలి"
+          Output:
+          {{
+            "thoughts": "Detected Telugu. Identified Word Repetition (WR) on 'నేను'. Strategy: Remove repetitions while preserving Telugu script.",
+            "text": "నేను వెళ్ళాలి",
+            "english_translation": "I... I... should go",
+            "metrics": {{"words": 3, "disfluencies": 2, "rate": 40}},
+            "analysis": "<ul><li><b>Primary:</b> Word Repetition (WR) of pronoun 'నేను'.</li><li><b>Linguistic:</b> Initial word repetition common in Telugu stuttering.</li></ul>",
+            "suggestions": "<ul><li><b>Immediate:</b> Practice slow Telugu speech.</li><li><b>Short-term:</b> Easy onset with Telugu consonants.</li></ul>",
+            "soap": {{"s": "User shows anxiety in Telugu speech.", "o": "2 repetitions in Telugu text.", "a": "Moderate stuttering in Telugu.", "p": "Telugu-specific fluency exercises."}},
+            "level": "Intermediate",
+            "classification": "Developmental Stuttering",
+            "demographics": "Young adult Telugu speaker"
+          }}
+
         Your task is to analyze the provided speech transcription and populate the following JSON schema fields accurately.
 
         1. "text": (String) The corrected, fluent version of the speech.
-           - **PRIMARY GOAL**: Remove ALL stutters, stammers, repetitions, and blocks while strictly preserving the original language, script, and intended meaning. Do NOT paraphrase or summarize. Every valid concept spoken by the user MUST be present in the final output.
-           - **SPELLING AND GRAMMAR**: Ensure the final text has PERFECT spelling and grammar in the target language. Correct any obvious transcription typos or misspellings. DO NOT alter the intended context and meaning. Provide EXACTLY the reconstructed user text without ANY spelling errors.
+           - **PRIMARY GOAL**: Remove ALL stutters, stammers, repetitions, and blocks while strictly preserving the original language, script, and intended meaning.
            - **SCRIPT PRESERVATION**: The output script MUST match the input script exactly.
              * If input is in Telugu script (e.g., "నా... నాకు"), output MUST be in Telugu script ("నాకు").
              * If input is in Latin/English (e.g., "I... I..."), output MUST be in Latin/English ("I").
              * Do NOT translate.
            - **STUTTER REMOVAL**:
-             * Remove repetitions (e.g., "b-b-ball" -> "ball", "I... I..." -> "I").
+             * Remove repetitions (e.g., "b-b-ball" -> "ball", "I... I..." -> "I", "गगई" -> "गई").
              * Remove prolongations (e.g., "ssss-snake" -> "snake").
              * Remove blocks/fillers (e.g., "um", "uh", "like" used as fillers).
              * Merge fragmented syllables (e.g., "u... u... umbrella" -> "umbrella").
-             * WARNING: STT engines often transcribe stutters with commas or hyphens (e.g., "b-b, boy", "దై, దైవం", "மா, மாமா", "ರ, ರ, ರಮೇಶ್"). Treat these as syllable repetitions and remove the stuttered fragments entirely across all languages!
-         * **CRITICAL - DO NOT DROP WORDS**: You must retain every intended word and concept from the original input. Do not over-correct, truncate, or summarize. If a word is heavily stuttered or fragmented, reconstruct the full word instead of deleting it.
-           * Example (Telugu): "ఆ ఆ ఆపదలో ఉ ఉ ఉన్నవాన్ని ఆదు కోవరం మన బాధ్యతా." -> "ఆపదలో ఉన్నవారిని ఆదుకోవడం మన బాధ్యత." (DO NOT drop words like "ఆపదలో").
-           * Example (Telugu Syllable Repetition): "దై, దైవం, మామా, మానుషా, రూరు, రూపేన." -> "దైవం, మానుషా, రూపేన."
-           * Example (Hindi): "म म मैं घ घ घर जा र र रहा हूँ" -> "मैं घर जा रहा हूँ".
-           * Example (Tamil): "நா... நான்... போ... போகிறேன்." -> "நான் போகிறேன்."
-           * Example (English): "The the the b-b-boy went to the the s-s-store, um, to buy, like, milk." -> "The boy went to the store to buy milk."
            - **Contextual Restoration**: If the stuttering has distorted a word (e.g. "mara" instead of "hamara" due to a block), restore the intended word based on the sentence context.
              * Example: "namu... makin" -> "Namumkin" (Phonetic restoration).
              * Example: "ha ha ha ha mara ba ba barat ma ma ma han" -> "Hamara Bharat Mahan" (Correcting 'mara'->'Hamara', 'barat'->'Bharat', 'han'->'Mahan' based on the famous phrase).
              * Example (Ambiguity): "I saw a b-b-b... big dog." -> "I saw a big dog." (Infer 'big' from context, not just completing 'b-b-b' to 'ball').
+           - **Spelling & Coherence Failsafe**: Ensure the reconstructed sentence makes perfect grammatical sense. If a user inserts confused words due to a stuttering block (e.g., "आप क्योंकि किसके साथ..." -> "आप किसके साथ..."), correct the grammar so the final sentence is meaningful and perfectly spelled.
            
            - If the input is mixed language (e.g., "Main market ja raha hoon"), KEEP IT MIXED.
            - Example: "I... I... wanna go" -> "I wanna go" (NOT "I want to go").
@@ -466,7 +509,15 @@ knowledge_agent_ai = Agent(
            - **Script Consistency**: Ensure the output script matches the input script (e.g. Devanagari -> Devanagari, Telugu -> Telugu, Tamil -> Tamil, Kannada -> Kannada). Do NOT transliterate to Latin/English script.
            - **Transliteration Handling**: If the input is in Latin script (e.g., "na peru..." for Telugu), the output MUST remain in Latin script. Do NOT convert it to the native script.
 
-        2. "english_translation": (String) This field is deprecated. Always return an empty string "".
+        2. "english_translation": (String) English translation of the input text.
+           - **REQUIRED** for Tamil (ta), Kannada (kn), Malayalam (ml), Hindi (hi), and Telugu (te).
+           - **OPTIONAL** for other languages - provide if the input is not in English.
+           - **EMPTY STRING** ("") for English inputs.
+           - **ACCURATE TRANSLATION**: Preserve the meaning and context of the original speech, including any stuttering patterns in the translation.
+           - **EXAMPLE**: If input is "నేను... నేను... వెళ్ళాలి" (Telugu), translation should be "I... I... should go"
+
+        3. "metrics": (Dictionary) Quantitative analysis of the speech.
+
 
         3. "metrics": (Dictionary) Quantitative analysis of the speech.
            - "words": (Integer) Total count of words in the original transcription (including fillers and repetitions).
@@ -480,17 +531,19 @@ knowledge_agent_ai = Agent(
 
         4. "analysis": (String) A detailed and insightful clinical analysis of speech patterns, formatted as an HTML unordered list (<ul><li>...</li></ul>).
            - **Core Behaviors**: Identify specific dysfluency types (SR, WR, PR, B, IN) with examples.
+           - **Strict Citation**: When citing examples, YOU MUST USE THE EXACT WORDS FROM THE INPUT. Do not use words from other languages.
            - **Strict Citation**: When citing examples, YOU MUST USE THE EXACT WORDS FROM THE INPUT.
-           - **Linguistic Patterns**: Check for Boli Dataset triggers: Stop consonants (/p/, /t/, /k/), clusters (/str/, /br/), or fricatives.
-           - **Contextual Insight**: Infer emotional state or cognitive load based on the content and speech rate.
            - **Formatting**: Use <b>bold tags</b> for key terms (e.g., "<b>Repetition</b>", "<b>Block</b>") to enhance readability.
+           - **Clarity**: Explain the clinical terms (like 'Blocks' or 'Prolongations') simply and clearly so the user understands exactly what their stuttering pattern was without needing a medical degree.
+           - **Contextual Insight**: Infer emotional state or cognitive load based on the content and speech rate. Use encouraging, empathetic language.
            - **Clinical Feedback**: Provide professional feedback similar to a Speech-Language Pathologist, noting severity and prognosis.
+           - MUST BE IN ENGLISH, regardless of the input language.
            - MUST BE IN ENGLISH.
 
         5. "suggestions": (String) Creative and evidence-based therapeutic interventions, formatted as an HTML unordered list (<ul><li>...</li></ul>).
            - **Targeted Exercises**: Provide specific exercises addressing the identified patterns (e.g., "Light Articulatory Contact for plosive sounds").
-           - **Rationale**: Briefly explain *why* the technique helps (e.g., "Reduces tension in the lips").
-           - **Functional Application**: Suggest how to apply this in daily conversation (e.g., "Practice this technique while ordering coffee").
+           - **Actionable & Clear**: Explain *how* to perform the technique step-by-step in plain, easy-to-understand language.
+           - **Rationale & Functional Application**: Briefly explain *why* the technique helps and how to apply it in daily conversation.
            - **Creative Drills**: Include engaging practice ideas (e.g., "Rhythmic speech practice using a metronome app").
            - **Prevention & Cure**: Include strategies for preventing secondary behaviors and managing relapse (e.g., "Desensitization to reduce fear").
            - MUST BE IN ENGLISH.
@@ -555,7 +608,7 @@ def get_ai_agent(analysis_mode: str = "balanced"):
     """Return a cached Agent instance based on the requested analysis mode."""
     mode = str(analysis_mode).lower() if analysis_mode else "balanced"
     if mode in ("speed", "fast", "low_latency"):
-        model_id = os.getenv("OLLAMA_MODEL_LOW_LATENCY", "llama3.2:3b")
+        model_id = os.getenv("OLLAMA_MODEL_LOW_LATENCY", "llama3.2:3b") # Faster for local CPU/low-tier GPU
     elif mode in ("deep", "high", "high_quality"):
         model_id = os.getenv("OLLAMA_MODEL_HIGH_QUALITY", "llama3.1:8b")
     else:
@@ -572,7 +625,7 @@ def get_ai_agent(analysis_mode: str = "balanced"):
 
 
 def extract_json_from_text(content: str, prompt_text: str) -> dict:
-    """Robustly extracts and parses JSON from LLM output."""
+    """Robustly extracts and parses JSON from LLM output with better handling for non-Latin scripts."""
     # 0. Remove <thought> tags (Chain of Thought) to prevent interference with JSON parsing
     content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
 
@@ -592,7 +645,7 @@ def extract_json_from_text(content: str, prompt_text: str) -> dict:
         
         # Fix common LLM error: "rate": max(...) = 88 -> "rate": 88
         json_str = re.sub(r'"rate":\s*[^,\n}]+?=\s*(\d+)', r'"rate": \1', json_str)
-        # Fix trailing commas (common LLM error) which breaks json.loads
+        # Fix trailing commas (common LLM error) - safe for Unicode strings
         json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
         # NOTE: Comment stripping removed to prevent breaking URLs (e.g. http://) inside strings
         
@@ -602,10 +655,30 @@ def extract_json_from_text(content: str, prompt_text: str) -> dict:
             # Unescape HTML content for frontend rendering
             if "analysis" in data and isinstance(data["analysis"], str):
                 data["analysis"] = html.unescape(data["analysis"])
+            else:
+                data["analysis"] = "<ul><li>Analysis could not be generated cleanly.</li></ul>"
+                
             if "suggestions" in data and isinstance(data["suggestions"], str):
                 data["suggestions"] = html.unescape(data["suggestions"])
-            if "text" not in data:
-                data["text"] = prompt_text
+            else:
+                data["suggestions"] = "<ul><li>Suggestions could not be generated cleanly.</li></ul>"
+                
+            if not data.get("text", "").strip():
+                fallback_text, _ = clean_stuttered_text(prompt_text)
+                data["text"] = fallback_text or prompt_text
+                
+            # Guarantee existence of all required UI fields
+            data.setdefault("english_translation", "")
+            data.setdefault("level", "Unknown")
+            data.setdefault("classification", "Unknown")
+            data.setdefault("demographics", "Unknown")
+            
+            if "metrics" not in data or not isinstance(data["metrics"], dict):
+                data["metrics"] = {"words": len(str(data["text"]).split()), "disfluencies": 0, "rate": 100}
+                
+            if "soap" not in data or not isinstance(data["soap"], dict):
+                data["soap"] = {"s": "-", "o": "-", "a": "-", "p": "-"}
+                
             return data
 
         # Attempt 1: Standard JSON parse
@@ -704,6 +777,126 @@ def extract_acoustic_features(audio_np: np.ndarray, sample_rate: int = 16000) ->
         logger.warning(f"⚠️ Feature extraction failed: {e}")
         return {"rms": 0.0, "zcr": 0.0, "variance": 0.0, "f0": 0.0}
 
+
+def normalize_south_indian_text(text: str, lang_code: str) -> str:
+    """
+    Post-processes transcribed text for South Indian languages to fix ONLY clear
+    Whisper transcription hallucinations. DOES NOT touch stutter patterns as they
+    are essential for clinical analysis.
+    
+    Handles Telugu, Tamil, Kannada, and Malayalam.
+    """
+    if not text or lang_code not in SOUTH_INDIAN_LANGS:
+        return text
+    
+    try:
+        # ONLY remove clear Whisper hallucinations - language tokens, system markers
+        hallucinations_si = {
+            "te": ["[telugu]", "telugu:", "అ:", "ఆ:"],  # Android TTS markers
+            "ta": ["[tamil]", "tamil:", "அ:", "ஆ:"],    # Android TTS markers
+            "kn": ["[kannada]", "kannada:", "ಅ:", "ಆ:"],  # Android TTS markers
+            "ml": ["[malayalam]", "malayalam:", "അ:", "ആ:"],  # Android TTS markers
+        }
+        
+        # Remove ONLY exact hallucinations (with context-aware rules)
+        for halluc in hallucinations_si.get(lang_code, []):
+            text = text.replace(halluc, "")
+        
+        # Fix excessive spaces (very common in segment joining)
+        # But preserve the stutter patterns (i... i..., b-b-ball)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+    except Exception as e:
+        logger.warning(f"⚠️ South Indian text normalization failed: {e}")
+        return text
+
+
+def generate_fallback_translation(text: str, lang_code: str) -> str:
+    """
+    Generate a basic English translation for fallback cases when AI analysis fails.
+    This provides readable text for South Indian languages in the UI.
+    """
+    if not text or lang_code not in {"ta", "kn", "ml", "hi", "te"}:
+        return ""
+    
+    try:
+        # Basic fallback translations for common phrases
+        fallback_translations = {
+            "te": {  # Telugu
+                "నేను": "I",
+                "నాకు": "to me",
+                "వెళ్ళాలి": "should go",
+                "చాలు": "enough",
+                "ఏమి": "what",
+                "ఎందుకు": "why",
+                "ఎక్కడ": "where",
+                "ఎప్పుడు": "when",
+                "ఎలా": "how",
+            },
+            "ta": {  # Tamil
+                "நான்": "I",
+                "எனக்கு": "to me",
+                "போகணும்": "should go",
+                "போதும்": "enough",
+                "என்ன": "what",
+                "ஏன்": "why",
+                "எங்கே": "where",
+                "எப்போது": "when",
+                "எப்படி": "how",
+            },
+            "kn": {  # Kannada
+                "ನಾನು": "I",
+                "ನನಗೆ": "to me",
+                "ಹೋಗಬೇಕು": "should go",
+                "ಸಾಕು": "enough",
+                "ಏನು": "what",
+                "ಯಾಕೆ": "why",
+                "ಎಲ್ಲಿದೆ": "where",
+                "ಯಾವಾಗ": "when",
+                "ಹೇಗೆ": "how",
+            },
+            "ml": {  # Malayalam
+                "ഞാൻ": "I",
+                "എനിക്ക്": "to me",
+                "പോകണം": "should go",
+                "മതി": "enough",
+                "എന്ത്": "what",
+                "എന്തുകൊണ്ട്": "why",
+                "എവിടെ": "where",
+                "എപ്പോൾ": "when",
+                "എങ്ങനെ": "how",
+            },
+            "hi": {  # Hindi
+                "मैं": "I",
+                "मुझे": "to me",
+                "जाना चाहिए": "should go",
+                "काफी": "enough",
+                "क्या": "what",
+                "क्यों": "why",
+                "कहाँ": "where",
+                "कब": "when",
+                "कैसे": "how",
+            }
+        }
+        
+        # Simple word-by-word translation for basic understanding
+        words = text.split()
+        translations = []
+        
+        for word in words:
+            # Remove common stutter markers for translation lookup
+            clean_word = re.sub(r'[-\.]{2,}', '', word).strip()
+            translation = fallback_translations.get(lang_code, {}).get(clean_word, f"[{clean_word}]")
+            translations.append(translation)
+        
+        return " ".join(translations)
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Fallback translation failed: {e}")
+        return f"[Translation unavailable - {LANGUAGE_NAMES.get(lang_code, lang_code)} text]"
+
+
 def query_groq_api(prompt: str, system_prompt: str) -> Optional[str]:
     """Uses Groq API (Llama 3 70B) for ultra-low latency intelligence."""
     if not GROQ_API_KEY:
@@ -714,7 +907,7 @@ def query_groq_api(prompt: str, system_prompt: str) -> Optional[str]:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "llama-3.3-70b-versatile", # Highly capable model for Indian languages
+        "model": "llama-3.3-70b-versatile",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
@@ -724,7 +917,8 @@ def query_groq_api(prompt: str, system_prompt: str) -> Optional[str]:
     }
 
     try:
-        response = requests.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=45)
+        session = get_requests_session()
+        response = session.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=GROQ_TIMEOUT)
         response.raise_for_status()
         json_response = response.json()
         if isinstance(json_response, dict) and 'choices' in json_response and len(json_response['choices']) > 0:
@@ -736,7 +930,8 @@ def query_groq_api(prompt: str, system_prompt: str) -> Optional[str]:
         logger.error(f"❌ Groq API returned unexpected structure: {json_response}")
         return None
     except requests.exceptions.RequestException as e:
-        logger.error(f"❌ Groq API request failed: {e}")
+        error_details = f" | Details: {e.response.text}" if getattr(e, 'response', None) is not None else ""
+        logger.error(f"❌ Groq API request failed: {e}{error_details}")
         return None
     except json.JSONDecodeError as e:
         logger.error(f"❌ Failed to decode Groq JSON response: {e} | Response text: {response.text}")
@@ -755,7 +950,7 @@ def get_script_constraint(transcript: str) -> str:
 # --- Fallback Fluency Helpers ---
 FILLER_WORDS = {"um", "uh", "ah", "er", "eh", "hmm", "mm", "like", "you know", "so", "well", "okay", "ok"}
 
-def clean_stuttered_text(text: str) -> Tuple[str, dict]:
+def clean_stuttered_text(text: str) -> (str, dict):
     """Quick heuristic to remove common stuttering artifacts and compute basic metrics.
 
     This is used as a resilient fallback when the AI analysis is slow, times out,
@@ -784,23 +979,12 @@ def clean_stuttered_text(text: str) -> Tuple[str, dict]:
             continue
 
         # Handle stutter patterns like 'b-b-ball' or 'I... I...'
-        if "..." in tok or ".." in tok or "-" in tok:
-            segments = re.split(r"[-\.]{1,3}", tok)
-            if len(segments) > 1:
-                is_stutter = False
-                if "..." in tok or ".." in tok:
-                    is_stutter = True
-                else:
-                    for i in range(len(segments) - 1):
-                        s1, s2 = segments[i].strip().lower(), segments[i+1].strip().lower()
-                        if s1 == s2 or len(s1) == 1:
-                            is_stutter = True
-                            break
-                if is_stutter:
-                    candidate = max(segments, key=len)
-                    if candidate and candidate != tok:
-                        disfluencies += 1
-                        tok = candidate
+        segments = re.split(r"[-\.]{1,3}", tok)
+        if len(segments) > 1:
+            candidate = max(segments, key=len)
+            if candidate and candidate != tok:
+                disfluencies += 1
+            tok = candidate
 
         stripped = normalize_token(tok)
         if not stripped:
@@ -825,7 +1009,6 @@ def clean_stuttered_text(text: str) -> Tuple[str, dict]:
         prev_word = stripped
 
     cleaned_text = "".join(cleaned_tokens).strip()
-    cleaned_text = re.sub(r'\s+', ' ', cleaned_text) # Collapse extra spaces
     word_count = len(re.findall(r"\b\w+\b", text, flags=re.UNICODE))
     rate = 100
     if word_count > 0:
@@ -869,17 +1052,14 @@ def should_prefer_cloud(language_name: str) -> bool:
     if FORCE_GROQ or GROQ_ONLY:
         return True
 
-    lang_code = normalize_language_name_to_code(language_name).lower()
-    
-    # English: local-first (Whisper, Llama, Kokoro/Edge-TTS)
-    if lang_code in {"en"}:
-        return False
-    
-    # South Indian languages and complex scripts are often weak in local Ollama models; prefer Groq when available.
-    if lang_code in SOUTH_INDIAN_LANGS or lang_code in COMPLEX_LANGUAGES:
+    lang_code = normalize_language_name_to_code(language_name)
+
+    # South Indian languages are often weak in local Ollama models; prefer Groq when available.
+    if lang_code in SOUTH_INDIAN_LANGS:
         return True
 
-    return False
+    # Complex languages like Hindi can also benefit from Groq for stable results.
+    return lang_code in COMPLEX_LANGUAGES
 
 
 def knowledge_agent_client(prompt: str, language: str = "English", tone: str = "Professional", session_id: str = None, acoustic_features: dict = None, analysis_mode: str = "balanced", prefer_cloud: bool = False):
@@ -928,8 +1108,8 @@ def knowledge_agent_client(prompt: str, language: str = "English", tone: str = "
     
     # Decide whether to prefer cloud (Groq) for this language.
     # Use local Ollama only when Groq is unavailable or when cloud fails and not CLOUD_ONLY.
-    cloud_first = prefer_cloud or should_prefer_cloud(language) or GROQ_ONLY
-    cloud_only = FORCE_GROQ or GROQ_ONLY
+    cloud_first = prefer_cloud or should_prefer_cloud(language)
+    cloud_only = FORCE_GROQ or GROQ_ONLY or CLOUD_ONLY
 
     def run_local():
         agent = get_ai_agent(analysis_mode)
@@ -992,12 +1172,11 @@ def knowledge_agent_client(prompt: str, language: str = "English", tone: str = "
 
     # --- FINAL FALLBACK: If both local and cloud fail ---
     logger.error("ℹ️ All AI models failed. Returning fallback.")
-    cleaned_text, fallback_metrics = clean_stuttered_text(prompt)
     return {
-        "text": cleaned_text,
+        "text": prompt,
         "english_translation": "",
-        "metrics": fallback_metrics,
-        "analysis": "<ul><li><strong>Processing Error</strong>: The AI analysis failed. Please check server logs. Applied basic heuristic cleanup.</li></ul>",
+        "metrics": {"words": len(prompt.split()), "disfluencies": 0, "rate": 0},
+        "analysis": "<ul><li><strong>Processing Error</strong>: The AI analysis failed. Please check server logs.</li></ul>",
         "suggestions": "<ul><li>Try recording again with clearer speech.</li></ul>",
         "soap": {"s": "-", "o": "-", "a": "Processing Error", "p": "Retry"},
         "level": "Error",
@@ -1005,10 +1184,41 @@ def knowledge_agent_client(prompt: str, language: str = "English", tone: str = "
         "demographics": "Unknown"
     }
 
+# --- Global Requests Session for Connection Pooling ---
+# This improves performance and reliability for repeated HTTP requests (e.g., Groq API)
+_requests_session = None
+
+def get_requests_session():
+    """Get or create a global requests session with connection pooling."""
+    global _requests_session
+    if _requests_session is None:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        _requests_session = requests.Session()
+        
+        # Configure retry strategy with exponential backoff
+        retry_strategy = Retry(
+            total=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            backoff_factor=0.5
+        )
+        
+        # Mount adapters for both HTTP and HTTPS with connection pooling
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+        _requests_session.mount("http://", adapter)
+        _requests_session.mount("https://", adapter)
+    
+    return _requests_session
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Clean up temporary files on startup to prevent disk clutter."""
     init_db() # Initialize DB
+    # Initialize requests session with connection pooling
+    get_requests_session()
+    logger.info("🔌 Requests session initialized with connection pooling (10 connections, 2 retries with exponential backoff)")
     if os.path.exists("temp"):
         now = time.time()
         for filename in os.listdir("temp"):
@@ -1084,33 +1294,35 @@ if sys.platform == "win32" and shutil.which("espeak-ng") is None:
             break
 
 check_and_download_models()
-try:
-    kokoro = Kokoro(os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"), os.path.join(MODELS_DIR, "voices-v1.0.bin"))
-except Exception as e:
-    logger.error(f"⚠️ Kokoro initialization failed: {e}")
-    logger.info("ℹ️  Deleting potentially corrupt model files. They will be re-downloaded on next run.")
-    if os.path.exists(os.path.join(MODELS_DIR, "kokoro-v1.0.onnx")): os.remove(os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"))
-    if os.path.exists(os.path.join(MODELS_DIR, "voices-v1.0.bin")): os.remove(os.path.join(MODELS_DIR, "voices-v1.0.bin"))
-    kokoro = None
+kokoro = None
+if not CLOUD_ONLY:
+    check_and_download_models()
+    try:
+        kokoro = Kokoro(os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"), os.path.join(MODELS_DIR, "voices-v1.0.bin"))
+    except Exception as e:
+        logger.error(f"⚠️ Kokoro initialization failed: {e}")
+        logger.info("ℹ️  Deleting potentially corrupt model files. They will be re-downloaded on next run.")
+        if os.path.exists(os.path.join(MODELS_DIR, "kokoro-v1.0.onnx")): os.remove(os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"))
+        if os.path.exists(os.path.join(MODELS_DIR, "voices-v1.0.bin")): os.remove(os.path.join(MODELS_DIR, "voices-v1.0.bin"))
+else:
+    logger.info("☁️ CLOUD_ONLY mode: Skipping Kokoro TTS model load to save memory.")
 
 # Initialize Whisper (Load once)
-whisper_model_size = TIER_CONFIG.get(ACTIVE_TIER, {}).get("whisper_model", "base")
-print(f"⏳ Loading Whisper '{whisper_model_size}' model with INT8 Quantization... (This may take a few minutes on first run)")
-
 whisper_model = None
-max_retries = 3
-for attempt in range(max_retries):
+if not CLOUD_ONLY:
+    whisper_model_size = TIER_CONFIG.get(ACTIVE_TIER, {}).get("whisper_model", "base")
+    print(f"⏳ Loading Whisper '{whisper_model_size}' model with INT8 Quantization... (This may take a few minutes on first run)")
     try:
-        whisper_model = WhisperModel(whisper_model_size, device="cpu", compute_type="int8")
-        break
+        # Changed device="cpu" to device="auto" for massive latency reduction on supported hardware
+        whisper_model = WhisperModel(whisper_model_size, device="auto", compute_type="int8")
     except Exception as e:
-        logger.warning(f"⚠️ Failed to download/load Whisper model (Attempt {attempt + 1}/{max_retries}): {e}")
-        if attempt < max_retries - 1:
-            print("⏳ Retrying in 5 seconds...")
-            time.sleep(5)
-        else:
-            logger.critical("❌ Critical Error: Could not load Whisper model. Check your internet connection. Hugging Face might be blocked or temporarily unreachable.")
-            sys.exit(1)
+        logger.warning(f"⚠️ Failed to load Whisper model on auto device: {e}. Falling back to CPU...")
+        try:
+            whisper_model = WhisperModel(whisper_model_size, device="cpu", compute_type="int8")
+        except Exception as e2:
+            logger.error(f"❌ Failed to load Whisper model: {e2}")
+else:
+    logger.info("☁️ CLOUD_ONLY mode: Skipping local Whisper model load to save memory.")
 
 # --- Internationalization (i18n) ---
 translations = {
@@ -1218,39 +1430,37 @@ def get_voice_gender(voice_id: str) -> str:
         return "Female"
     return "Male"
 
-async def generate_openai_audio(text: str, voice_id: str) -> Optional[str]:
-    """Generates audio using OpenAI TTS API as a fast cloud alternative."""
-    if not OPENAI_API_KEY: return None
+async def generate_elevenlabs_audio(text: str, voice_id: str) -> Optional[str]:
+    """Generates audio using ElevenLabs API."""
+    if not ELEVENLABS_API_KEY: return None
     
-    # OpenAI voices: alloy, echo, fable, onyx, nova, shimmer
-    valid_voices = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
-    # Default to 'nova' (a great female voice) if the requested voice isn't an OpenAI voice
-    openai_voice = voice_id if voice_id in valid_voices else "nova"
+    # Default to a nice therapeutic voice if specific ID not provided
+    # '21m00Tcm4TlvDq8ikWAM' is Rachel (American, Calm)
+    eleven_voice_id = "21m00Tcm4TlvDq8ikWAM" 
     
-    url = "https://api.openai.com/v1/audio/speech"
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{eleven_voice_id}"
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json"
     }
     data = {
-        "model": "tts-1", # Extremely fast low-latency model
-        "input": text,
-        "voice": openai_voice
+        "text": text,
+        "model_id": "eleven_flash_v2_5",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
     }
     
     try:
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, lambda: requests.post(url, json=data, headers=headers))
+        session = get_requests_session()
+        response = await loop.run_in_executor(None, lambda: session.post(url, json=data, headers=headers))
         if response.status_code == 200:
             filename = f"{uuid.uuid4()}.mp3"
             filepath = f"temp/{filename}"
             with open(filepath, "wb") as f:
                 f.write(response.content)
             return f"/temp/{filename}"
-        else:
-            logger.error(f"❌ OpenAI TTS failed: {response.text}")
     except Exception as e:
-        logger.error(f"❌ OpenAI TTS request failed: {e}")
+        logger.error(f"❌ ElevenLabs TTS failed: {e}")
     return None
 
 async def tts_router(text: str, lang: str, voice_id: str = None, speed: float = SPEED) -> Optional[str]:
@@ -1294,35 +1504,28 @@ async def tts_router(text: str, lang: str, voice_id: str = None, speed: float = 
     # Check if we should use Kokoro (English only, model loaded, and voice is a Kokoro voice)
     use_kokoro = lang == "en" and kokoro is not None and voice_id.startswith("af_")
 
-    # Route cloud requests to OpenAI TTS instead of ElevenLabs
-    prefer_cloud_tts = False # Disabled to prevent OpenAI quota errors and force free Edge-TTS
-    
-    if prefer_cloud_tts:
-        logger.info(f"   ☁️ Using OpenAI TTS (Cloud) for '{lang}'...")
-        audio_url = await generate_openai_audio(text, voice_id)
-        if audio_url:
-            return audio_url
-        logger.warning("⚠️ OpenAI TTS failed. Falling back to local Edge-TTS/Kokoro...")
-
     audio_data = b""
     mime_type = "audio/wav"
 
     if use_kokoro:
         logger.info(f"   🚀 Using Kokoro TTS (Local) - {voice_id}")
-        # Run blocking Kokoro call in executor
-        loop = asyncio.get_running_loop()
-        samples, sample_rate = await loop.run_in_executor(None, lambda: kokoro.create(text, voice=voice_id, speed=speed, lang="en-us"))
+        try:
+            # Run blocking Kokoro call in executor
+            loop = asyncio.get_running_loop()
+            samples, sample_rate = await loop.run_in_executor(None, lambda: kokoro.create(text, voice=voice_id, speed=speed, lang="en-us"))
 
-        # Convert Float32 to Int16 PCM for browser compatibility
-        # Many browsers/players play float32 WAV as silence
-        if isinstance(samples, np.ndarray) and samples.dtype == np.float32:
-            samples = np.clip(samples, -1.0, 1.0)
-            samples = (samples * 32767).astype(np.int16)
+            # Convert Float32 to Int16 PCM for browser compatibility
+            if isinstance(samples, np.ndarray) and samples.dtype == np.float32:
+                samples = np.clip(samples, -1.0, 1.0)
+                samples = (samples * 32767).astype(np.int16)
 
-        # Write to in-memory buffer
-        buffer = io.BytesIO()
-        wav.write(buffer, sample_rate, samples)
-        audio_data = buffer.getvalue()
+            # Write to in-memory buffer
+            buffer = io.BytesIO()
+            wav.write(buffer, sample_rate, samples)
+            audio_data = buffer.getvalue()
+        except Exception as e:
+            logger.error(f"❌ Local Kokoro TTS failed: {e}")
+            audio_data = b"" # Will trigger ElevenLabs Cloud fallback
     else:
         # Fallback: If voice_id is a Kokoro voice but we can't use Kokoro, switch to Edge-TTS default
         if voice_id.startswith("af_"):
@@ -1341,8 +1544,6 @@ async def tts_router(text: str, lang: str, voice_id: str = None, speed: float = 
         except edge_tts.exceptions.NoAudioReceived:
             logger.warning(f"⚠️ EdgeTTS NoAudioReceived with voice {voice_id}. Trying fallback voice...")
 
-            # Smart Fallback: Try swapping gender/voice if the primary fails
-            fallback_voice = "en-US-JennyNeural" if "Christopher" in voice_id else "en-US-ChristopherNeural"
             ALTERNATE_VOICES = {
                 "en": "en-US-JennyNeural",
                 "hi": "hi-IN-SwaraNeural",
@@ -1379,10 +1580,10 @@ async def tts_router(text: str, lang: str, voice_id: str = None, speed: float = 
             f.write(audio_data)
         return f"/temp/{filename}"
 
-    # --- CLOUD FALLBACK: OpenAI ---
-    if False: # Disabled OpenAI fallback
-        logger.warning("⚠️ Local TTS failed. Falling back to OpenAI (Cloud)...")
-        audio_url = await generate_openai_audio(text, voice_id)
+    # --- CLOUD FALLBACK: ElevenLabs ---
+    if ELEVENLABS_API_KEY:
+        logger.warning("⚠️ Local TTS failed. Falling back to ElevenLabs (Cloud)...")
+        audio_url = await generate_elevenlabs_audio(text, voice_id)
         if audio_url:
             return audio_url
 
@@ -1451,7 +1652,8 @@ async def process_url(
             # Use a browser-like User-Agent to avoid 403 Forbidden on some direct links
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
             # Add size limit check (e.g., 50MB)
-            with requests.get(url, stream=True, timeout=60, headers=headers) as r:
+            session = get_requests_session()
+            with session.get(url, stream=True, timeout=60, headers=headers) as r:
                 r.raise_for_status()
                 
                 content_length = r.headers.get('content-length')
@@ -1525,23 +1727,21 @@ def transcribe_with_deepgram(audio_data: Union[bytes, str], language: str = None
         logger.error(f"❌ Failed to read audio data for Deepgram: {e}")
         return None
 
-    # Models to try in order: nova-3 (newest), nova-2 (standard), general (fallback)
-    models = ["nova-3", "nova-2", "general"]
     # Language-aware model selection: South Indian languages + complex scripts only work with nova-3
     # For other languages/auto-detect, try nova-3 → nova-2 → general
     if language and language in SOUTH_INDIAN_LANGS:
-        models = ["nova-3"]  # South Indian scripts only support nova-3
-        logger.info(f"ℹ️  Using nova-3 only for South Indian language: {language}")
+        models = ["nova-3", "nova-2", "general"]  # Try nova-3 first, but allow fallback
+        logger.info(f"ℹ️  Trying nova-3 first for South Indian language: {language}, with fallbacks")
     elif language and language in COMPLEX_LANGUAGES:
-        models = ["nova-3"]  # Complex scripts (like Hindi) prefer nova-3
-        logger.info(f"ℹ️  Using nova-3 only for complex language: {language}")
+        models = ["nova-3", "nova-2", "general"]  # Complex scripts (like Hindi) prefer nova-3, but allow fallback
+        logger.info(f"ℹ️  Trying nova-3 first for complex language: {language}, with fallbacks")
     else:
         models = ["nova-3", "nova-2", "general"]  # English and auto-detect: try all
 
     for model in models:
         params = {
             "model": model,
-            "smart_format": "true",
+            "smart_format": "false", # Must be false, otherwise Deepgram deletes stutters/repetitions
             "filler_words": "true",
             "punctuate": "true",
         }
@@ -1554,7 +1754,8 @@ def transcribe_with_deepgram(audio_data: Union[bytes, str], language: str = None
 
         response = None
         try:
-            response = requests.post(url, headers=headers, data=data, timeout=30)
+            session = get_requests_session()
+            response = session.post(url, headers=headers, data=data, timeout=30)
             response.raise_for_status()
             result = response.json()
             # Safely access the transcript
@@ -1621,7 +1822,6 @@ async def process_audio_pipeline(input_data: Union[bytes, str], lang_pref, voice
             else:
                 with open(input_data, "r", encoding="utf-8") as f:
                     transcribed_text = f.read()
-            detected_lang = lang_pref if lang_pref != "auto" else "en" # Default or trust pref
             
             if lang_pref == "auto":
                 if any('\u0900' <= c <= '\u097F' for c in transcribed_text): detected_lang = "hi"
@@ -1662,8 +1862,23 @@ async def process_audio_pipeline(input_data: Union[bytes, str], lang_pref, voice
             segments = []
             info = None
 
-            # --- STT STRATEGY: Local Whisper First, Deepgram only as fallback ---
-            logger.info("🎤 Preferring local Whisper (offline) for transcription, with Deepgram as a fallback if needed.")
+            # --- STT STRATEGY ---
+            # South Indian/Complex: Cloud First. English: Local First.
+            prefer_cloud_stt = False
+            if lang_pref != "auto" and (lang_pref in SOUTH_INDIAN_LANGS or lang_pref in COMPLEX_LANGUAGES) and DEEPGRAM_API_KEY:
+                prefer_cloud_stt = True
+            elif GROQ_ONLY or CLOUD_ONLY:
+                prefer_cloud_stt = True
+                
+            if prefer_cloud_stt:
+                logger.info(f"☁️ Preferring Cloud STT (Deepgram) for '{lang_pref}'...")
+                dg_result = await loop.run_in_executor(None, lambda: transcribe_with_deepgram(input_data, lang_pref, mime_type))
+                if dg_result and dg_result.get("text"):
+                    transcribed_text = dg_result["text"]
+                    detected_lang = dg_result.get("language", lang_pref)
+                    class DummyInfo: duration = 10.0
+                    info = DummyInfo()
+                    segments = [] # Cloud doesn't return local Whisper word segments
 
             tiers_to_try = [ACTIVE_TIER]
             if ACTIVE_TIER == "low_latency":
@@ -1671,75 +1886,97 @@ async def process_audio_pipeline(input_data: Union[bytes, str], lang_pref, voice
             elif ACTIVE_TIER == "balanced":
                 tiers_to_try.append("high_quality") # Fallback: Try beam search if greedy fails
 
-            for attempt_tier in tiers_to_try: 
-                def transcribe_blocking(tier):
-                    tier_settings = TIER_CONFIG.get(tier, TIER_CONFIG["low_latency"])
+            if not transcribed_text and whisper_model is not None:
+                if prefer_cloud_stt:
+                    logger.warning("⚠️ Cloud STT failed. Falling back to local Whisper...")
+                else:
+                    logger.info("💻 Preferring Local Whisper STT for English/Auto...")
+                    
+                for attempt_tier in tiers_to_try:
+                    def transcribe_blocking(tier):
+                        tier_settings = TIER_CONFIG.get(tier, TIER_CONFIG["low_latency"])
+                        current_no_speech_threshold = 0.6
+                        current_beam_size = tier_settings.get("beam_size", 5)
 
-                    # --- Dynamic Transcription Tuning ---
-                    # Non-English languages, especially with stuttering, benefit from a wider beam search
-                    # and a more sensitive speech detection threshold.
-                    current_no_speech_threshold = 0.6
-                    current_beam_size = tier_settings.get("beam_size", 5)
-
-                    # --- High-Resolution Multilingual Logic ---
-                    transcribe_kwargs = {
-                        "beam_size": current_beam_size,
-                        "best_of": 5,
-                        "patience": 2.0, # Allows deeper exploration of the audio signal
-                        "repetition_penalty": 1.0,
-                        "no_speech_threshold": current_no_speech_threshold,
-                        "word_timestamps": True,
-                        "vad_filter": True, # Enabled VAD to eliminate disturbing background noises
-                        "vad_parameters": dict(min_silence_duration_ms=2000, speech_pad_ms=400), # 2s tolerance preserves stutter blocks without cutting off
-                        "condition_on_previous_text": False,
-                        "log_prob_threshold": None, # Force transcription even for low-confidence audio (essential for stuttering)
-                    }
-                    logger.info(f"🎤 Transcribing with Whisper ({whisper_model_size} model, tier={tier}, beam_size={current_beam_size})...")
-                    try:
-                        # Fallback to input_data since audio_np is local to feature extraction task
-                        source = io.BytesIO(input_data) if isinstance(input_data, bytes) else input_data
-
-                        # Dynamic language setting for Whisper
-                        transcribe_kwargs["language"] = lang_pref if lang_pref != "auto" else None
-                        # Use priming prompt only if available for the specified language
-
+                        # Optimize VAD for South Indian languages and stuttered speech
+                        # NOTE: VAD only filters SILENCE (>min_silence_ms). Stutter patterns still have voice activity
+                        # and will NOT be removed. This only helps preserve word boundaries during silence gaps.
+                        # Stuttering blocks often manifest as long silent pauses. We MUST increase the silence duration
+                        # tolerance to 3000ms so VAD doesn't split a single stuttered sentence into broken segments.
+                        is_south_indian = lang_pref in SOUTH_INDIAN_LANGS
+                        min_silence_ms = 3000
+                        speech_pad_ms = 500 if is_south_indian else 400     # Preserve more speech context
+                        
+                        transcribe_kwargs = {
+                            "beam_size": current_beam_size,
+                            "best_of": 5,
+                            "patience": 2.0, # Allows deeper exploration of the audio signal
+                            "repetition_penalty": 1.0,
+                            "no_speech_threshold": current_no_speech_threshold,
+                            "compression_ratio_threshold": 10.0, # CRITICAL: Prevent Whisper from dropping heavy repetitions (e.g., "I I I I")
+                            "vad_filter": True, # Enabled VAD to eliminate disturbing background noises
+                            "vad_parameters": dict(min_silence_duration_ms=min_silence_ms, speech_pad_ms=speech_pad_ms), # Adaptive silence tolerance
+                            "word_timestamps": False,
+                            "condition_on_previous_text": False,
+                            "language": lang_pref if lang_pref != "auto" else None,
+                            "temperature": (0.0, 0.2, 0.4)
+                        }
                         if lang_pref in PRIMING_PROMPTS:
                             transcribe_kwargs["initial_prompt"] = PRIMING_PROMPTS[lang_pref]
-                        transcribe_kwargs["temperature"] = (0.0, 0.2, 0.4) # Keep temperature for robustness
 
-                        segments_gen, info = whisper_model.transcribe(source, **transcribe_kwargs)
-                        return list(segments_gen), info
-                    except Exception as e:
-                        logger.error(f"❌ Whisper Transcription Error: {e}")
-                        return [], None
-                
-                segments, info = await loop.run_in_executor(None, lambda: transcribe_blocking(attempt_tier))
+                        logger.info(f"🎤 Transcribing with Whisper ({whisper_model_size} model, tier={tier}, beam_size={current_beam_size})...")
+                        try:
+                            source = io.BytesIO(input_data) if isinstance(input_data, bytes) else input_data
+                            segments_gen, info = whisper_model.transcribe(source, **transcribe_kwargs)
+                            return list(segments_gen), info
+                        except Exception as e:
+                            logger.error(f"❌ Whisper Transcription Error: {e}")
+                            return [], None
 
-                if info is None:
-                    logger.warning(f"⚠️ Tier {attempt_tier} failed (info is None). Retrying with next tier...")
-                    continue
+                    segments, info = await loop.run_in_executor(None, lambda tier=attempt_tier: transcribe_blocking(tier))
 
-                current_text = "".join([s.text for s in segments]).strip()
-
-                # Filter Whisper hallucinations
-                hallucinations = ["[Silence]", "[Music]", "[BLANK_AUDIO]", "(silence)", "(music)"]
-                if current_text.strip() in hallucinations:
-                    current_text = ""
-
-                if current_text:
-                    transcribed_text = current_text
-                    detected_lang = info.language
-                    break
-                else:
-                    if attempt_tier != tiers_to_try[-1]:
-                        logger.warning(f"⚠️ Empty result with {attempt_tier} tier. Retrying with next tier...")
+                    if info is None:
+                        logger.warning(f"⚠️ Tier {attempt_tier} failed (info is None). Retrying with next tier...")
                         continue
+
+                    # Improved segment concatenation for South Indian languages
+                    # NOTE: Using spaces between segments PRESERVES stutter patterns (i... i..., b-b-ball)
+                    # Without spaces, Whisper segments can merge into unrecognizable words
+                    # Preserve word boundaries by adding spaces between segments
+                    segment_texts = []
+                    for s in segments:
+                        text = s.text.strip() if hasattr(s, 'text') else str(s).strip()
+                        if text:  # Only add non-empty segments
+                            segment_texts.append(text)
+                    current_text = " ".join(segment_texts).strip()
+                    
+                    # Normalize text for South Indian languages to fix ONLY Whisper hallucinations
+                    # (does NOT remove stutter patterns - they are essential for analysis)
+                    current_text = normalize_south_indian_text(current_text, lang_pref)
+
+                    # Filter Whisper hallucinations and environmental tags
+                    current_text = re.sub(r'\[.*?\]', '', current_text)
+                    current_text = re.sub(r'\(.*?\)', '', current_text)
+                    
+                    if not current_text.strip():
+                        current_text = ""
+
+                    if current_text:
+                        transcribed_text = current_text
+                        detected_lang = info.language
+                        break
+                    else:
+                        if attempt_tier != tiers_to_try[-1]:
+                            logger.warning(f"⚠️ Empty result with {attempt_tier} tier. Retrying with next tier...")
+                            continue
+            else:
+                logger.info("☁️ CLOUD_ONLY mode or Missing Whisper: Bypassing local Whisper.")
 
             acoustic_features = await feature_task
 
             # --- CLOUD FALLBACK STT (if local Whisper fails) ---
-            if not transcribed_text and DEEPGRAM_API_KEY:
-                logger.info("⚠️ Local Whisper failed to produce a transcript. Falling back to Deepgram (Cloud)...")
+            if not transcribed_text and DEEPGRAM_API_KEY and not prefer_cloud_stt:
+                logger.info("⚠️ Local Whisper STT failed. Falling back to Deepgram (Cloud)...")
                 dg_result = await loop.run_in_executor(None, lambda: transcribe_with_deepgram(input_data, lang_pref, mime_type))
                 if dg_result and dg_result.get("text"):
                     transcribed_text = dg_result["text"]
@@ -1811,13 +2048,8 @@ async def process_audio_pipeline(input_data: Union[bytes, str], lang_pref, voice
         # Run blocking AI call in a separate thread to prevent server freeze
         logger.info(f"Running AI analysis for language '{agent_lang_name}' (mode={analysis_mode})...")
 
-        # Increased timeouts to give local models more time, especially on CPU.
-        analysis_timeouts = {
-            "low_latency": 25,   # ~25 seconds for fastest model
-            "balanced": 120,     # 120s for llama3.1:3b on CPU (increased for timeout fix)
-            "high_quality": 120  # 2 minutes for the largest model
-        }
-        timeout_secs = analysis_timeouts.get(analysis_mode, 20)
+        # Get timeout for the current analysis mode (configurable via environment variables)
+        timeout_secs = OLLAMA_TIMEOUTS.get(analysis_mode, 20)
 
         try:
             ai_data = await asyncio.wait_for(
@@ -1836,55 +2068,44 @@ async def process_audio_pipeline(input_data: Union[bytes, str], lang_pref, voice
         except asyncio.TimeoutError:
             logger.warning(f"⏱️ AI analysis timed out after {timeout_secs}s (mode={analysis_mode}). Attempting cloud fallback if available.")
             ai_data = None
+        except Exception as e:
+            logger.warning(f"⚠️ AI analysis failed abruptly: {e}. Attempting cloud fallback if available.")
+            ai_data = None
 
-            # Fallback to cloud if the local Ollama path is too slow or unavailable.
-            if GROQ_API_KEY:
-                fallback_timeout = max(timeout_secs * 2, 20)
-                logger.info(f"⏭️ Trying cloud fallback (Groq) with {fallback_timeout}s timeout...")
-                try:
-                    ai_data = await asyncio.wait_for(
-                        loop.run_in_executor(None, lambda: knowledge_agent_client(
-                            transcribed_text,
-                            language=agent_lang_name,
-                            tone=tone_pref,
-                            session_id=session_id,
-                            acoustic_features=acoustic_features,
-                            analysis_mode=analysis_mode,
-                            prefer_cloud=True
-                        )),
-                        timeout=fallback_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(f"⏱️ Cloud fallback also timed out after {fallback_timeout}s.")
-                except Exception as e:
-                    logger.error(f"❌ Cloud fallback (Groq) failed: {e}")
-
-            if not ai_data:
-                ai_data = {
-                    "text": transcribed_text,
-                    "english_translation": "N/A",
-                    "analysis": "<ul><li><strong>Timeout</strong>: AI response took too long. Try switching to 'low_latency' mode, ensuring Ollama is running locally, or providing a Groq API key for fallback.</li></ul>",
-                    "suggestions": "<ul><li>Try again or use a faster mode (low_latency).</li></ul>",
-                    "metrics": {"words": len(transcribed_text.split()) if transcribed_text else 0, "disfluencies": 0, "rate": 100},
-                    "soap": {"s": "N/A", "o": "N/A", "a": "Processing Timeout", "p": "Retry"},
-                    "level": "Error",
-                    "classification": "Timeout",
-                    "demographics": "Unknown"
-                }
+        # Universal fallback to cloud if the local Llama path failed or timed out.
+        if not ai_data and GROQ_API_KEY:
+            fallback_timeout = max(int(timeout_secs * CLOUD_FALLBACK_TIMEOUT_MULTIPLIER), CLOUD_FALLBACK_MIN_TIMEOUT)
+            logger.info(f"⏭️ Trying cloud fallback (Groq) with {fallback_timeout}s timeout...")
+            try:
+                ai_data = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: knowledge_agent_client(
+                        transcribed_text,
+                        language=agent_lang_name,
+                        tone=tone_pref,
+                        session_id=session_id,
+                        acoustic_features=acoustic_features,
+                        analysis_mode=analysis_mode,
+                        prefer_cloud=True
+                    )),
+                    timeout=fallback_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ Cloud fallback also timed out after {fallback_timeout}s. Returning minimal response.")
+            except Exception as e:
+                logger.error(f"❌ Cloud fallback (Groq) failed: {e}")
 
         if not ai_data:
-            cleaned_text, fallback_metrics = clean_stuttered_text(transcribed_text)
-            # Unified Fallback for connection error or timeout
-            # Fallback for connection error
+            # Absolute Final Fallback if everything is broken
+            fallback_text, fallback_metrics = clean_stuttered_text(transcribed_text)
             ai_data = {
-                "text": cleaned_text,
-                "english_translation": "N/A",
-                "analysis": "<ul><li><strong>Processing Error / Timeout</strong>: The AI response could not be parsed or took too long.</li><li>Applied basic heuristic cleanup to remove stutters.</li></ul>",
-                "suggestions": "<ul><li>Try recording again with clearer speech.</li><li>Consider using a faster mode or checking API keys.</li></ul>",
+                "text": fallback_text or transcribed_text,
+                "english_translation": generate_fallback_translation(transcribed_text, detected_lang),
+                "analysis": "<ul><li><strong>AI Processing Unavailable</strong>: The LLM model timed out or encountered an error. A basic heuristic filter was applied instead.</li></ul>",
+                "suggestions": "<ul><li>Check if Ollama is running and has enough memory.</li><li>Consider using a 'low_latency' tier or providing a Groq API key.</li></ul>",
                 "metrics": fallback_metrics,
-                "soap": {"s": "N/A", "o": "N/A", "a": "Processing Error", "p": "Retry"},
+                "soap": {"s": "N/A", "o": "N/A", "a": "System Overloaded or Unavailable", "p": "Ensure LLM backend is active"},
                 "level": "Error",
-                "classification": "Parsing/Timeout Failure",
+                "classification": "System Error",
                 "demographics": "Unknown"
             }
 
@@ -1902,17 +2123,32 @@ async def process_audio_pipeline(input_data: Union[bytes, str], lang_pref, voice
             except:
                 wer_score = 0.0
 
+        # For South Indian languages and Hindi, show English translation instead of raw script in UI
+        # This improves user experience by showing readable text while preserving analysis accuracy
+        display_input_text = transcribed_text
+        display_response_input_text = transcribed_text
+
+        # Languages that should show English translation in the UI instead of raw script
+        TRANSLATION_LANGUAGES = {"ta", "kn", "ml", "hi", "te"}  # Tamil, Kannada, Malayalam, Hindi, Telugu
+
+        if detected_lang in TRANSLATION_LANGUAGES:
+            english_translation = ai_data.get("english_translation", "").strip()
+            if english_translation and english_translation != "N/A":
+                display_input_text = english_translation
+                display_response_input_text = english_translation
+                logger.info(f"📝 Showing English translation for {LANGUAGE_NAMES.get(detected_lang, detected_lang)} input")
+
         return {
             "input_audio_url": input_audio_url,
-            "input_text": transcribed_text,
+            "input_text": display_input_text,  # Show translation for South Indian languages
             "output_audio_url": output_audio_url,
             "output_text": corrected_text,
             "analysis": ai_data,
-            "response": {**ai_data, "audio_url": output_audio_url, "input_audio_url": input_audio_url, "input_text": transcribed_text, "acoustic_features": acoustic_features}, # For new UI compatibility
+            "response": {**ai_data, "audio_url": output_audio_url, "input_audio_url": input_audio_url, "input_text": display_response_input_text, "acoustic_features": acoustic_features}, # For new UI compatibility
             "metrics": {"wer": wer_score},
             "detected_language": detected_lang,
             "status": "success",
-            "transcription": transcribed_text
+            "transcription": transcribed_text  # Keep raw transcription for analysis
         }
     except Exception as e:
         logger.error("❌ Pipeline Error:")
