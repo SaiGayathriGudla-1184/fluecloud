@@ -1,0 +1,10 @@
+# Environments
+venv/
+__pycache__/
+.env
+
+# Data, Models, and Temporary Files
+models/
+temp/
+data/
+*.db

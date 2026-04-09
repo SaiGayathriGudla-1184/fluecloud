@@ -1,0 +1,26 @@
+<<<<<<< HEAD
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+temp/
+data/
+models/
+.env
+=======
+venv/
+__pycache__/
+*.pyc
+.git/
+.env
+temp/
+models/
+data/
+agent_client.py
+therapy_knowledge_base.yml
+vocal_agent_mac.sh
+evaluate_stt.py
+finetune_whisper.py
+setup_test_data.py
+>>>>>>> 4a061bd5aa45e150fe8069b75d008d668a073d2e

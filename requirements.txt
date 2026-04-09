@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-multipart
+jinja2
+python-dotenv
+langdetect
+faster-whisper
+kokoro-onnx
+edge-tts
+agno
+ollama
+jiwer
+scipy
+numpy
+requests
+pydantic

@@ -1,0 +1,28 @@
+services:
+  app:
+    build: .
+    container_name: fluency-net-app
+    ports:
+      - "9067:9067"
+    volumes:
+      - ./temp:/app/temp  # Persist temp files (optional)
+      - ./models:/app/models # Persist downloaded models
+      - ./data:/app/data # Persist session database
+      - hf_cache:/root/.cache/huggingface # Persist Whisper models
+    environment:
+      - HOST=0.0.0.0
+      - PORT=9067
+      - CLOUD_ONLY=true
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - FORCE_GROQ=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9067/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  hf_cache:
